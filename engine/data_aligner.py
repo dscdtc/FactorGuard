@@ -48,13 +48,13 @@ def compute_forward_returns(ohlcv_df, forward_periods=None):
         for ts_code, group in df.groupby('ts_code'):
             # 仅取有效交易日子集
             valid = group[group['_valid']]
-            if len(valid) <= period:
+            if len(valid) <= period + 1:
                 continue
 
             # 在有效交易日子集上计算前瞻收益
-            # forward_return = open[t+N] / open[t+1] - 1
+            # forward_return = open[t+1+N] / open[t+1] - 1
             next_open = valid['open'].shift(-1)          # t+1 日开盘价（买入价）
-            future_open = valid['open'].shift(-period)   # t+N 日开盘价（卖出价）
+            future_open = valid['open'].shift(-(period + 1))  # t+1+N 日开盘价（卖出价）
 
             forward_ret = future_open.values / next_open.values - 1
 
@@ -146,11 +146,10 @@ def align_factor_returns(factor_df, ohlcv_df, basic_df, forward_period=None):
     if forward_period is None:
         forward_period = DEFAULT_FORWARD_PERIOD
 
-    # 1. 筛选有效因子值（非空、非无限）
+    # 1. 标准化非法因子值。保留缺失值，供下游按完整股票池计算覆盖率。
     factor = factor_df.copy()
     factor['trade_date'] = pd.to_datetime(factor['trade_date'])
-    factor = factor[factor['factor_value'].notna()]
-    factor = factor[~np.isinf(factor['factor_value'])]
+    factor.loc[np.isinf(factor['factor_value']), 'factor_value'] = np.nan
 
     if factor.empty:
         return pd.DataFrame(columns=['ts_code', 'trade_date', 'factor_value', 'forward_return'])
@@ -174,12 +173,33 @@ def align_factor_returns(factor_df, ohlcv_df, basic_df, forward_period=None):
         how='inner'
     )
 
-    # 5. 按 historical_all_a 规则构建股票池
-    #    MVP 中不做 ST 过滤，仅排除停牌（forward_return 为 NaN 的即为停牌）
-    aligned = aligned.dropna(subset=['forward_return'])
+    # 5. 保留压力测试与适用性分析所需的基础字段。对齐层拥有
+    #    (ts_code, trade_date) 契约，统一在这里合并可避免调用者行为不一致。
+    if basic_df is not None and not basic_df.empty:
+        basic = basic_df.copy()
+        basic['trade_date'] = pd.to_datetime(basic['trade_date'])
+        context_cols = [
+            column for column in (
+                'total_mv', 'circ_mv', 'turnover_rate', 'pe_ttm', 'pb'
+            )
+            if column in basic.columns and column not in aligned.columns
+        ]
+        if context_cols:
+            aligned = aligned.merge(
+                basic[['ts_code', 'trade_date'] + context_cols],
+                on=['ts_code', 'trade_date'],
+                how='left',
+            )
 
-    # 只保留需要的列，排序输出
-    result = aligned[['ts_code', 'trade_date', 'factor_value', 'forward_return']].copy()
+    # 6. 保留缺失的收益标签和因子值。计算引擎自行筛选有效样本，
+    #    同时可使用这些行计算真实覆盖率。
+
+    output_cols = ['ts_code', 'trade_date', 'factor_value', 'forward_return']
+    output_cols.extend(
+        column for column in ('total_mv', 'circ_mv', 'turnover_rate', 'pe_ttm', 'pb')
+        if column in aligned.columns
+    )
+    result = aligned[output_cols].copy()
     result = result.sort_values(['ts_code', 'trade_date']).reset_index(drop=True)
 
     return result

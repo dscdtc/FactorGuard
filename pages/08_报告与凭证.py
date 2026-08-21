@@ -10,12 +10,222 @@ from models.evidence import EvidenceRecord
 from models.audit_result import AuditResult
 from engine.evidence_engine import generate_audit_result, generate_evidence_records
 from engine.hash_utils import compute_evidence_hash, compute_report_hash
+from engine.ai_analysis import (
+    generate_ai_analysis,
+    get_default_provider_id,
+    get_provider_presets,
+    get_provider_ui_defaults,
+    is_model_api_key_configured,
+)
 from engine.run_recorder import save_run
+from engine.factor_loader import get_precomputed_metrics, get_precomputed_source_hash
 from ui.metric_cards import render_verdict_badge, render_metric_row
 from ui.color_utils import get_evidence_color, get_verdict_color
-from config import COLOR_PASS, COLOR_WARN, COLOR_FAIL, COLOR_NEUTRAL
+from config import (
+    COLOR_PASS, COLOR_WARN, COLOR_FAIL, COLOR_NEUTRAL,
+    DEFAULT_BOOTSTRAP_BLOCKS, DEFAULT_BOOTSTRAP_REPS, DEFAULT_BOOTSTRAP_SEED,
+    ENGINE_VERSION,
+)
 
 st.set_page_config(page_title="报告与凭证", page_icon="📋", layout="wide")
+
+
+def _normalize_eval_results(factor_id, audit_results, session_state):
+    """统一实时评估和预计算指标字段，保证报告页可渲染。"""
+    eval_results = audit_results.get("traditional_eval") or session_state.get("eval_results") or {}
+    precomputed = {}
+    try:
+        precomputed = get_precomputed_metrics(factor_id)
+    except Exception:
+        precomputed = {}
+
+    if not eval_results and not precomputed:
+        return {}
+
+    normalized = dict(eval_results)
+
+    if precomputed:
+        normalized.setdefault("ic_mean", precomputed.get("ic_mean_5d", 0.0))
+        normalized.setdefault("rank_ic_mean", precomputed.get("ic_mean_5d", 0.0))
+        normalized.setdefault("icir", precomputed.get("icir_5d", 0.0))
+        normalized.setdefault("coverage", precomputed.get("coverage", 0.0))
+        normalized.setdefault("sample_count", int(precomputed.get("usable_rows", precomputed.get("sample_rows", 0)) or 0))
+        normalized.setdefault("direction_consistency", 0.0)
+        normalized.setdefault("ic_p_value", None)
+        no_future_check = precomputed.get("no_future_check")
+        normalized.setdefault(
+            "max_delay",
+            1 if no_future_check is True else (-1 if no_future_check is False else None),
+        )
+
+    # 兼容旧字段名
+    if "sample_count" not in normalized and "n_samples" in normalized:
+        normalized["sample_count"] = normalized["n_samples"]
+    if "n_samples" not in normalized and "sample_count" in normalized:
+        normalized["n_samples"] = normalized["sample_count"]
+
+    normalized.setdefault("ic_mean", 0.0)
+    normalized.setdefault("rank_ic_mean", 0.0)
+    normalized.setdefault("icir", 0.0)
+    normalized.setdefault("direction_consistency", 0.0)
+    normalized.setdefault("coverage", 0.0)
+    normalized.setdefault("sample_count", 0)
+    normalized.setdefault("n_samples", normalized["sample_count"])
+    normalized.setdefault("ic_p_value", None)
+    normalized.setdefault("max_delay", None)
+
+    return normalized
+
+
+def _normalize_stress_results(audit_results, session_state):
+    """统一压力测试字段。"""
+    stress_results = audit_results.get("stress_test") or session_state.get("stress_results") or {}
+    if not isinstance(stress_results, dict):
+        return {}
+
+    normalized = dict(stress_results)
+    test_results = normalized.get("test_results", []) or []
+    retention_ratios = normalized.get("retention_ratios", [])
+    if not retention_ratios and test_results:
+        retention_ratios = [
+            item.get("retention_ratio")
+            for item in test_results
+            if item.get("retention_ratio") is not None
+        ]
+    normalized["retention_ratios"] = retention_ratios
+    normalized.setdefault("summary", {})
+    return normalized
+
+
+def _normalize_duplicate_results(audit_results, session_state):
+    """统一重复检测字段。"""
+    dup_results = audit_results.get("duplicate_check") or session_state.get("dup_results") or {}
+    if not isinstance(dup_results, dict):
+        return {}
+    if not dup_results:
+        return {}
+
+    normalized = dict(dup_results)
+    duplicates_found = normalized.get("duplicates_found")
+    if duplicates_found is None:
+        duplicates_found = len(normalized.get("duplicates", []))
+        normalized["duplicates_found"] = duplicates_found
+
+    if "overall_verdict" not in normalized:
+        if duplicates_found <= 0:
+            normalized["overall_verdict"] = "不相似"
+        elif duplicates_found == 1:
+            normalized["overall_verdict"] = "中等相似"
+        else:
+            normalized["overall_verdict"] = "高度相似"
+
+    return normalized
+
+
+def _render_ai_analysis(
+    audit_results,
+    factor_id,
+    audit,
+    records,
+    evidence_hash,
+):
+    """Render the optional AI sidecar without touching the formal report."""
+    st.caption("独立投研辅助区，不构成正式鉴证结论，也不进入正式下载内容。")
+
+    presets = get_provider_presets()
+    provider_ids = [preset.provider_id for preset in presets]
+    provider_names = {preset.provider_id: preset.display_name for preset in presets}
+    default_provider = get_default_provider_id()
+    if default_provider not in provider_ids:
+        default_provider = "custom"
+    selected_provider = st.selectbox(
+        "模型供应商",
+        provider_ids,
+        index=provider_ids.index(default_provider),
+        format_func=provider_names.get,
+    )
+    default_model, effective_base_url = get_provider_ui_defaults(selected_provider)
+    selected_model = st.text_input(
+        "模型 ID",
+        value=default_model,
+        key=f"ai_model_{selected_provider}",
+    ).strip()
+    custom_base_url = None
+    if selected_provider == "custom":
+        custom_base_url = st.text_input(
+            "自定义 Base URL",
+            value=effective_base_url,
+            key="ai_custom_base_url",
+            placeholder="https://example.com/v1",
+        ).strip()
+    else:
+        st.caption(f"API 根地址：`{effective_base_url}`")
+
+    selected_config = {
+        "provider": selected_provider,
+        "model": selected_model,
+        "base_url": custom_base_url if selected_provider == "custom" else effective_base_url,
+    }
+
+    if is_model_api_key_configured():
+        st.success("API Key 环境变量已配置")
+    else:
+        st.warning("API Key 环境变量未配置，将使用 rule_fallback")
+    st.caption("密钥仅从 FACTORGUARD_LLM_API_KEY 读取，页面不接收或保存密钥。")
+
+    ai_analysis = audit_results.get("ai_analysis")
+    if audit_results.get("ai_analysis_evidence_hash") != evidence_hash:
+        ai_analysis = None
+    if ai_analysis and audit_results.get("ai_analysis_config") != selected_config:
+        ai_analysis = None
+
+    if st.button(
+        "生成 AI 辅助解读",
+        type="secondary",
+        help="仅基于当前证据生成反方质询和下一步实验建议，不修改正式结论或报告。",
+    ):
+        ai_result = generate_ai_analysis(
+            factor_id,
+            audit.conclusion,
+            audit.evidence_dimensions,
+            records,
+            evidence_hash,
+            provider=selected_provider,
+            model=selected_model,
+            base_url=custom_base_url,
+        )
+        ai_analysis = ai_result.model_dump()
+        audit_results["ai_analysis"] = ai_analysis
+        audit_results["ai_analysis_evidence_hash"] = evidence_hash
+        audit_results["ai_analysis_config"] = selected_config
+        st.session_state["audit_results"] = audit_results
+
+    if not ai_analysis:
+        st.info("尚未生成辅助解读。无模型配置时会自动生成确定性的规则降级结果。")
+        return
+
+    source_label = "模型生成" if ai_analysis.get("source") == "model" else "规则降级"
+    st.info(
+        f"来源：{source_label} · 供应商：{provider_names.get(ai_analysis.get('provider'), ai_analysis.get('provider', 'unknown'))} · "
+        f"模型：{ai_analysis.get('model', 'unknown')} · "
+        f"AI 分析哈希：`{ai_analysis.get('ai_analysis_hash', '')}`"
+    )
+    if ai_analysis.get("fallback_reason"):
+        st.caption(f"降级原因：{ai_analysis['fallback_reason']}")
+    st.markdown(f"**摘要**：{ai_analysis.get('summary', '')}")
+    st.markdown("**反方质询**")
+    for item in ai_analysis.get("counter_arguments", []):
+        st.markdown(
+            f"- {item.get('text', '')} "
+            f"（证据：`{'`, `'.join(item.get('evidence_ids', []))}`）"
+        )
+    st.markdown("**下一步实验**")
+    for item in ai_analysis.get("next_experiments", []):
+        st.markdown(
+            f"- {item.get('text', '')} "
+            f"（证据：`{'`, `'.join(item.get('evidence_ids', []))}`）"
+        )
+    st.caption("以上内容仅供研究辅助，正式鉴证结论以本页确定性证据和报告为准。")
 
 
 def render():
@@ -25,36 +235,54 @@ def render():
     audit_results = st.session_state.get("audit_results", {})
     factor_id = st.session_state.get("selected_factor_id", st.session_state.get("factor_id", "unknown"))
     factor_name = st.session_state.get("selected_factor_name", factor_id)
+    factor_spec = st.session_state.get("selected_factor_spec", st.session_state.get("factor_spec", {}))
+
+    eval_results = _normalize_eval_results(factor_id, audit_results, st.session_state)
+    stress_results = _normalize_stress_results(audit_results, st.session_state)
+    dup_results = _normalize_duplicate_results(audit_results, st.session_state)
+    suitability_results = audit_results.get("suitability") or st.session_state.get("suitability_results", {})
+    data_snapshot_hash = st.session_state.get("data_snapshot_hash") or get_precomputed_source_hash(factor_id)
 
     # 空状态检查
-    if not audit_results or not audit_results.get("traditional_eval"):
-        st.warning("⚠️ 暂无鉴证数据，请先运行鉴证流程。")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("🚀 前往鉴证运行", type="primary", width='stretch'):
-                st.switch_page("pages/09_鉴证运行.py")
-        with col_b:
-            if st.button("📊 前往传统评估", type="secondary", width='stretch'):
-                st.switch_page("pages/03_传统评估.py")
+    if not eval_results:
+        formal_empty, ai_empty = st.tabs(["正式报告", "AI 辅助解读"])
+        with formal_empty:
+            st.warning("⚠️ 暂无鉴证数据，请先运行鉴证流程。")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("🚀 前往鉴证运行", type="primary", width="stretch"):
+                    st.switch_page("pages/09_鉴证运行.py")
+            with col_b:
+                if st.button("📊 前往传统评估", type="secondary", width="stretch"):
+                    st.switch_page("pages/03_传统评估.py")
+        with ai_empty:
+            st.info("AI 辅助解读需要引用正式 evidence_id。请先完成鉴证，再返回此 Tab。")
         return
 
-    factor_spec = st.session_state.get("selected_factor_spec", st.session_state.get("factor_spec", {}))
-    eval_results = audit_results.get("traditional_eval", st.session_state.get("eval_results", {}))
-    stress_results = audit_results.get("stress_test", st.session_state.get("stress_results", {}))
-    dup_results = audit_results.get("duplicate_check", st.session_state.get("dup_results", {}))
-    input_check = audit_results.get("input_check", {})
-    data_align = audit_results.get("data_align", {})
-    suitability_results = st.session_state.get("suitability_results", {})
-    data_snapshot_hash = st.session_state.get("data_snapshot_hash", "")
-    ai_explanation = audit_results.get("ai_summary", st.session_state.get("ai_explanation", ""))
-
     # 生成证据记录和鉴证结果
-    records = generate_evidence_records(eval_results, stress_results, dup_results, suitability_results)
+    records = generate_evidence_records(
+        eval_results, stress_results, dup_results, suitability_results, factor_spec
+    )
     audit = generate_audit_result(factor_id, factor_spec, eval_results, stress_results, dup_results, suitability_results)
 
     # 计算哈希
-    evidence_hash = compute_evidence_hash(factor_spec, data_snapshot_hash, {}, eval_results)
-    report_hash = compute_report_hash(evidence_hash, ai_explanation)
+    audit_config = {
+        "forward_period": st.session_state.get("forward_period", 5),
+        **st.session_state.get("evaluation_config", {"time_range": "全量"}),
+        "bootstrap_block_size": DEFAULT_BOOTSTRAP_BLOCKS,
+        "bootstrap_reps": DEFAULT_BOOTSTRAP_REPS,
+        "bootstrap_seed": DEFAULT_BOOTSTRAP_SEED,
+    }
+    evidence_hash = compute_evidence_hash(
+        factor_spec, data_snapshot_hash, audit_config, eval_results,
+        stress_results, dup_results, suitability_results,
+    )
+    report_payload = {
+        "conclusion": audit.conclusion,
+        "dimensions": audit.evidence_dimensions,
+        "records": [r.model_dump() for r in records],
+    }
+    report_hash = compute_report_hash(evidence_hash, report_payload)
 
     audit.evidence_hash = evidence_hash
     audit.report_hash = report_hash
@@ -66,17 +294,24 @@ def render():
         "conditional": "条件有效", "supported": "当前支持"
     }.get(audit.conclusion, audit.conclusion)
 
-    # 保存运行记录到工作台
-    save_run(factor_name, factor_id, audit.conclusion,
-             audit.risk_summary[0] if audit.risk_summary else conclusion_label,
-             st.session_state)
+    # 保存运行记录，供首页的最近运行区展示
+    audit.run_id = save_run(
+        factor_name,
+        factor_id,
+        audit.conclusion,
+        audit.risk_summary[0] if audit.risk_summary else conclusion_label,
+        st.session_state,
+        evidence_hash=evidence_hash,
+        report_hash=report_hash,
+        run_params=audit_config,
+    )
 
     st.markdown(f"**因子**: {factor_name} ({factor_id})")
     st.markdown(f"**结论**: {conclusion_label}")
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "总览", "数据与时间质检", "传统评估", "压力测试", "重复性", "适用性", "复现凭证"
+    tab1, tab_ai, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "总览", "AI 辅助解读", "数据与时间质检", "传统评估", "压力测试", "重复性", "适用性", "复现凭证"
     ])
 
     # ============ Tab 1: 总览 ============
@@ -122,6 +357,9 @@ def render():
             st.subheader("推荐下一测试")
             st.info(audit.next_test)
 
+    with tab_ai:
+        _render_ai_analysis(audit_results, factor_id, audit, records, evidence_hash)
+
     # ============ Tab 2: 数据与时间质检 ============
     with tab2:
         st.subheader("闸门清单")
@@ -135,11 +373,11 @@ def render():
             "详情": f"{coverage:.1%}"
         })
         # 时间正确性检查项
-        max_delay = eval_results.get("max_delay", 0)
+        max_delay = eval_results.get("max_delay")
         gate_checks.append({
             "检查项": "最大时延检查",
-            "结果": "pass" if max_delay > 0 else ("warn" if max_delay == 0 else "fail"),
-            "详情": f"{max_delay} 天"
+            "结果": "untested" if max_delay is None else ("pass" if max_delay > 0 else ("warn" if max_delay == 0 else "fail")),
+            "详情": "未测试" if max_delay is None else f"{max_delay} 天"
         })
         # 样本量检查
         n_samples = eval_results.get("n_samples", 0)
@@ -159,9 +397,12 @@ def render():
         with cols[0]:
             st.metric("数据覆盖率", f"{coverage:.1%}")
         with cols[1]:
-            st.metric("最大时延", f"{max_delay} 天")
+            st.metric("最大时延", "未测试" if max_delay is None else f"{max_delay} 天")
         with cols[2]:
             st.metric("样本量", n_samples)
+
+        if not audit_results.get("traditional_eval"):
+            st.caption("当前报告基于预计算指标生成；如需实时重算结果，请先运行完整鉴证流程。")
 
     # ============ Tab 3: 传统评估 ============
     with tab3:
@@ -233,19 +474,19 @@ def render():
                     "测试名称": r.get("test_name_cn", r.get("test_name", "")),
                     "基线 RankIC": r.get("baseline_rank_ic", 0),
                     "压力后 RankIC": r.get("stress_rank_ic", 0),
-                    "保留比例": r.get("retention_ratio", 0),
-                    "方向保持": "是" if r.get("direction_kept") else "否",
+                    "保留比例": r.get("retention_ratio"),
+                    "方向保持": "未测试" if r.get("direction_kept") is None else ("是" if r.get("direction_kept") else "否"),
                     "状态": r.get("verdict", ""),
                 })
             if table_data:
-                st.dataframe(pd.DataFrame(table_data), width='stretch', hide_index=True)
+                st.dataframe(pd.DataFrame(table_data), width="stretch", hide_index=True)
         else:
             st.info("暂无压力测试数据。请先运行鉴证流程。")
 
     # ============ Tab 5: 重复性 ============
     with tab5:
         st.subheader("因子重复性检测")
-        if isinstance(dup_results, dict):
+        if dup_results:
             dup_count = dup_results.get("duplicates_found", 0)
             if dup_count > 0:
                 st.warning(f"发现 {dup_count} 个疑似重复因子")
@@ -257,7 +498,7 @@ def render():
             else:
                 st.success("未发现重复因子")
         else:
-            st.info("暂无重复检测数据。请先运行鉴证流程。")
+            st.info("重复检测尚未执行，信息独立性记为未测试。")
 
     # ============ Tab 6: 适用性 ============
     with tab6:
@@ -275,6 +516,8 @@ def render():
             "factor_id": factor_id,
             "version": "1.0.0",
             "data_snapshot": data_snapshot_hash,
+            "engine_version": ENGINE_VERSION,
+            "config": audit_config,
             "evidence_hash": evidence_hash,
             "report_hash": report_hash,
             "timestamp": datetime.now().isoformat(),
@@ -285,7 +528,7 @@ def render():
         st.json(credential)
 
         st.markdown("---")
-        st.caption("证据哈希可用于验证报告未被篡改")
+        st.caption("证据哈希和报告哈希用于验证正式报告未被篡改；AI 分析使用独立哈希。")
 
         st.markdown("---")
         st.subheader("导出报告")
@@ -311,8 +554,11 @@ def render():
         # 导出 JSON 凭证
         json_credential = json.dumps({
             "factor_id": factor_id,
+            "run_id": audit.run_id,
             "version": "1.0.0",
             "data_snapshot": data_snapshot_hash,
+            "engine_version": ENGINE_VERSION,
+            "config": audit_config,
             "evidence_hash": evidence_hash,
             "report_hash": report_hash,
             "conclusion": audit.conclusion,

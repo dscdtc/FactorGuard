@@ -1,6 +1,8 @@
 # FactorGuard 技术设计文档
 
 > 基于 PRD V1.1 修订版 | 目标提交：2026年8月31日 | 版本：MVP 1.0
+>
+> **实现校准（2026-08-20）：** 当前代码使用 DuckDB + Parquet。运行历史、证据哈希和报告哈希已经持久化；工作副本包含全市场近一年比赛快照，`data/factor_cache/` 仍是预留路径。最终状态与验证证据见 [PROJECT_STATUS.md](PROJECT_STATUS.md)。
 
 ---
 
@@ -12,11 +14,11 @@
 | 图表库 | Plotly | >= 5.18 | 交互式图表，支持 SVG/Canvas 渲染 |
 | 数据处理 | Pandas | >= 2.1 | 因子计算、CSV 读写、时序操作 |
 | 数值计算 | NumPy | >= 1.26 | 矩阵运算、统计指标 |
-| 数据库 | SQLite3 | 内置 | 因子元数据缓存、鉴证记录持久化 |
+| 数据库 | DuckDB | `duckdb` | 因子元数据、预计算指标与鉴证记录 |
 | 因子解析 | Lark | >= 1.1 | 受限公式语言解析器，生成 AST |
 | 环境管理 | venv | Python 3.11+ | 隔离开发环境 |
-| 数据源（主） | 本地数据 `H:\data\stock-trading-data-pro` | — | 每只股票独立 CSV，含日线 OHLCV、市值、PE/PB、行业分类、指数成分股标记 |
-| 数据源（辅） | akshare / baostock | 免费开源 | 补充财务数据、ST 状态、退市信息等本地数据缺失字段 |
+| 数据源（主） | 本地数据 `E:\Quantclass\stock-trading-data-pro` | — | 每只股票独立 CSV，含日线 OHLCV、市值、换手率、利润/现金流、资产负债和行业分类 |
+| 数据源（辅） | 未接入 | — | akshare / baostock 仅作为后续补充方案，不是当前运行依赖 |
 
 ### 1.1 选型理由
 
@@ -24,11 +26,11 @@
 
 **Plotly：** 支持缩放、悬停、导出等交互操作，比 Matplotlib 更适合研究报告级图表展示。内置 `plotly.subplots` 支持多图联排。
 
-**SQLite：** 零配置、零依赖，适合 MVP 阶段的轻量数据持久化。存储因子元数据、鉴证运行记录和预计算缓存。
+**DuckDB：** 统一管理因子元数据和预计算指标，并与 Parquet 快照配合。当前 `audit_runs` 表已建表，运行历史写入由 `run_recorder.py` 负责。
 
 **Lark：** Python 原生解析器生成器，支持上下文无关文法，用于实现受限公式语言的 AST 解析，避免 `eval` 安全风险。
 
-**本地数据源：** 本地 CSV 数据集覆盖 A 股全量股票日线行情（沪深京三地），包含 OHLCV、市值、PE/PB 和行业分类，零网络依赖、零 API 调用限制。免费三方数据源（akshare / baostock）作为补充，用于获取本地数据缺失的字段（如 ST 状态、退市日期、财务披露时点等）。
+**本地数据源：** 本地 CSV 数据集覆盖 A 股全量股票日线行情（沪深京三地），包含 OHLCV、市值、换手率、利润/现金流、资产负债和行业分类，零网络依赖、零 API 调用限制。源文件不含 PE/PB，也缺少财务披露时点，因此这些字段不能冒充历史时点可用的估值或质量证据。免费三方数据源（akshare / baostock）只作为后续补充方案。
 
 ---
 
@@ -39,19 +41,18 @@ FactorGuard/
 ├── venv/                          # Python 虚拟环境（gitignore）
 ├── requirements.txt               # 依赖清单
 ├── setup.bat                      # Windows 一键环境初始化脚本
-├── app.py                         # Streamlit 主入口，多页面路由
+├── app.py                         # 首页：快照、新建鉴证、最近运行、Demo 入口
 ├── config.py                      # 全局配置（路径、参数、颜色映射）
 │
 ├── pages/                         # Streamlit 多页面模块
-│   ├── 01_ 🏠_工作台.py           # 首页：新建鉴证、最近运行、Demo入口
-│   ├── 02_ 📥_因子输入.py         # 因子输入：内置/文本/公式/上传/Python占位
+│   ├── 02_ 📥_因子输入.py         # 因子输入：内置/规则文本/受限公式/因子值上传
 │   ├── 03_ 🔍_传统评估.py         # Tear Sheet：IC/RankIC/分组/换手/衰减/滚动
 │   ├── 04_ 💪_压力测试.py         # 对抗式压力测试视图
 │   ├── 05_ 🔗_重复性检测.py       # 因子关系：公式/暴露/收益三层检测
 │   ├── 06_ 📊_适用性地图.py       # 多维度适用性热力图
 │   ├── 07_ 👨‍🏫_大师方法拆解.py     # 公开方法来源、原则、代理因子
 │   ├── 08_ 🧾_报告与凭证.py       # 总览报告、证据维度、复现凭证
-│   └── 09_ 🧪_Skill 管理.py       # 因子库管理、Skill 加载器
+│   └── 09_ 🧪_鉴证运行.py         # 一站式鉴证流程与运行记录
 │
 ├── engine/                        # 核心计算引擎
 │   ├── __init__.py
@@ -67,7 +68,8 @@ FactorGuard/
 │   ├── duplicate_detect.py        # 三重重复检测
 │   ├── evidence_engine.py         # 证据模型、结论生成
 │   ├── hash_utils.py              # 确定性哈希（evidence_hash/report_hash）
-│   └── ai_explainer.py            # AI 解释（LLM 调用 + 模板降级）
+│   ├── ai_explainer.py            # 确定性规则解析与证据解释
+│   └── ai_analysis.py             # 证据约束模型适配、输出校验与规则降级
 │
 ├── models/                        # 数据模型（Pydantic）
 │   ├── __init__.py
@@ -79,11 +81,11 @@ FactorGuard/
 ├── data/                          # 数据存储
 │   ├── snapshot/                  # 冻结数据快照（Parquet，从本地CSV合并生成）
 │   │   ├── daily_ohlcv.parquet    # 日线行情（合并所有 sh/sz/bj CSV）
-│   │   ├── daily_basic.parquet    # 市值/PE/PB/流通市值
+│   │   ├── daily_basic.parquet    # 市值/换手率/利润现金流/资产负债
 │   │   └── stock_basic.parquet    # 股票列表（代码、名称、上市日期、行业）
-│   ├── factor_cache/              # 预计算因子值缓存
+│   ├── factor_cache/              # 预留的磁盘因子缓存（当前未启用）
 │   │   └── {factor_id}.parquet
-│   └── factor_master.db           # SQLite 数据库
+│   └── factor_master.duckdb       # DuckDB 数据库
 │
 ├── Factors/                       # 现有因子库（只读引用）
 │   ├── skill-quant-factor-directional-alpha/
@@ -235,7 +237,7 @@ ai-berkshire 的 `quality-screen` 定义了 **7 条去劣指标 + 3 条豁免规
 
 ---
 
-## 4. 数据库设计（SQLite）
+## 4. 数据库设计（DuckDB）
 
 ### 4.1 表结构
 
@@ -293,7 +295,7 @@ CREATE TABLE suitability_cache (
 
 ### 4.2 初始化策略
 
-MVP 启动时，`factor_loader.py` 扫描 Factors/ 目录下的三个 Skill 仓库，解析 `factor_index.json` 获取因子元数据，解析 `validation_summary_real.json` 获取预计算指标，批量写入 SQLite。此后所有页面从 SQLite 读取，不重复解析 JSON 文件。
+MVP 启动时，`factor_loader.py` 扫描 Factors/ 目录下的三个 Skill 仓库，解析 `factor_index.json` 获取因子元数据，解析 `validation_summary_real.json` 获取预计算指标，批量写入 DuckDB。DuckDB 不可用时，读取接口回退到仓库 JSON 文件。
 
 ---
 
@@ -301,12 +303,12 @@ MVP 启动时，`factor_loader.py` 扫描 Factors/ 目录下的三个 Skill 仓�
 
 ### 5.0 数据加载器（data_loader.py）
 
-**职责：** 从本地 `H:\data\stock-trading-data-pro` 加载全量 A 股日线数据，合并生成快照 Parquet。
+**职责：** 从本地 `E:\Quantclass\stock-trading-data-pro` 加载全量 A 股日线数据，合并生成快照 Parquet。
 
 #### 本地数据格式
 
 ```
-H:\data\stock-trading-data-pro\
+E:\Quantclass\stock-trading-data-pro\
 ├── sh600000.csv    # 沪市主板
 ├── sh600001.csv
 ├── ...
@@ -334,12 +336,12 @@ H:\data\stock-trading-data-pro\
 | 成交额 | float | 日成交额（元） | — |
 | 流通市值 | float | 流通市值（元） | ✅ |
 | 总市值 | float | 总市值（元） | ✅ |
-| 市盈率TTM | float | PE-TTM | 估值维度 |
-| 市现率TTM | float | PCF-TTM | — |
+| 净利润TTM | float | 滚动净利润（源文件未提供披露时点） | 仅作数据字段，不直接作为时点正确证据 |
+| 现金流TTM | float | 滚动现金流（源文件未提供披露时点） | 仅作数据字段，不等同于 PCF |
 | 总资产 | float | 总资产 | 质量维度 |
 | 净资产 | float | 净资产 | 质量维度 |
 | 总负债 | float | 总负债 | 质量维度 |
-| 净利润(同比增长) | float | 净利润同比增速 | 成长维度 |
+| 净利润(当季) | float | 当季净利润（源文件未提供披露时点） | 仅作数据字段 |
 | 沪深300成分股 | bool | 是否沪深300 | 股票池过滤 |
 | 上证50成分股 | bool | 是否上证50 | 股票池过滤 |
 | 中证500成分股 | bool | 是否中证500 | 股票池过滤 |
@@ -358,26 +360,30 @@ H:\data\stock-trading-data-pro\
 | 退市日期 | akshare `stock_info_a_code_name` | 退市日期 |
 | 复权因子 | baostock `query_adjust_factor` | 后复权因子 |
 | 停牌状态 | 从本地数据推断（成交量=0） | 近似判断 |
+| 历史 PE/PB | 待选定可靠来源 | 当前 CSV 不提供；成长价值维度保持未测试 |
+| 财务披露时点 | 待选定可靠来源 | 当前 CSV 不提供；财务因子不得据此声称无未来数据 |
 
 **加载流程：**
 
 ```
-1. 检查 data/snapshot/ 下是否存在快照 Parquet
-   ├── 存在且未过期 → 直接加载
-   └── 不存在或需要更新 → 执行全量加载
-2. 全量加载：
-   a. 遍历 H:\data\stock-trading-data-pro\*.csv
+1. 页面检查 data/snapshot/ 下是否存在快照 Parquet
+   ├── 存在 → 直接加载
+   └── 不存在 → 快速降级为预计算展示，不扫描原始 CSV
+2. 用户显式运行 `scripts/build_snapshots.py` 后流式构建：
+   a. 遍历 E:\Quantclass\stock-trading-data-pro\*.csv
    b. 对每个文件：
       - 使用 GBK 编码读取
       - 跳过第一行（数据来源说明）
       - 标准化列名：股票代码→ts_code, 交易日期→trade_date, 开盘价→open, ...
       - 日期列转为 datetime
-   c. 合并所有 DataFrame
-   d. 按 (ts_code, trade_date) 排序并去重
-   e. 存储为 daily_ohlcv.parquet（Snappy 压缩）
-   f. 提取市值/PE/PB 列存储为 daily_basic.parquet
-   g. 提取股票基本信息存储为 stock_basic.parquet
-3. 返回合并后的 DataFrame
+      - 可选按闭区间 `date_start/date_end` 过滤
+      - 按 (ts_code, trade_date) 排序并去重
+      - 立即写入 Parquet row group，不在内存中累积全市场 DataFrame
+   c. 提取行情列写入 daily_ohlcv.parquet（ZSTD 压缩）
+   d. 提取市值、换手率、利润现金流和资产负债列写入 daily_basic.parquet
+   e. 每只股票保留最新一条名称和行业，写入 stock_basic.parquet
+3. 先写 `.building` 临时文件；三份均成功后原子替换正式快照
+4. 构建参数、行数、范围和文件哈希记录在 `data/snapshot/manifest.json`
 ```
 
 **关键实现：**
@@ -386,7 +392,7 @@ H:\data\stock-trading-data-pro\
 import pandas as pd
 from pathlib import Path
 
-DATA_ROOT = Path("H:/data/stock-trading-data-pro")
+DATA_ROOT = Path("E:/Quantclass/stock-trading-data-pro")
 SNAPSHOT_DIR = Path("data/snapshot")
 
 COLUMN_MAP = {
@@ -402,15 +408,15 @@ COLUMN_MAP = {
     "成交额": "amount",
     "流通市值": "circ_mv",
     "总市值": "total_mv",
-    "市盈率TTM": "pe_ttm",
-    "市现率TTM": "pcf_ttm",
+    "净利润TTM": "net_profit_ttm",
+    "现金流TTM": "cash_flow_ttm",
     "总资产": "total_assets",
     "净资产": "net_assets",
     "总负债": "total_liability",
-    "净利润(同比增长)": "net_profit_yoy",
-    "申万一级行业分类": "industry_l1",
-    "申万二级行业分类": "industry_l2",
-    "申万三级行业分类": "industry_l3",
+    "净利润(当季)": "net_profit_quarter",
+    "新版申万一级行业名称": "industry_l1",
+    "新版申万二级行业名称": "industry_l2",
+    "新版申万三级行业名称": "industry_l3",
 }
 
 def load_all_csvs() -> pd.DataFrame:
@@ -449,7 +455,7 @@ def load_all_csvs() -> pd.DataFrame:
    b. 读取 validation_summary_real.json 获取预计算指标（ic_mean_5d, icir_5d, coverage, turnover, status）
    c. 读取 SKILL.md 获取方向和计算说明
    d. 构建 FactorSpec 对象
-   e. 写入 SQLite factor_metadata 和 precomputed_results 表
+   e. 写入 DuckDB factor_metadata 和 precomputed_results 表
 3. 返回因子列表
 ```
 
@@ -607,7 +613,7 @@ GRAMMAR = r"""
 **维度定义：**
 - **市值：** 按 total_mv 分位数分为大盘/中盘/小盘/微盘
 - **波动率：** 按 20 日波动率分位数分为低/中/高/极高波动
-- **风格：** 按 PE/PB 综合分位数分为成长/平衡/价值
+- **风格：** 有可靠历史 PE/PB 时按综合分位数分为成长/平衡/价值；当前本地 CSV 缺少这些字段，因此该维度必须返回未测试
 - **时间：** 按自然年或自定义时间段分段
 
 **计算流程：**
@@ -682,18 +688,26 @@ def compute_evidence_hash(
     factor_spec: FactorSpec,
     data_snapshot_hash: str,
     config: dict,
-    evaluation_results: dict
+    evaluation_results: dict,
+    stress_results: dict,
+    duplicate_results: dict,
+    suitability_results: dict,
+    engine_version: str
 ) -> str:
     payload = json.dumps({
         "factor_spec": factor_spec.model_dump(exclude_none=True),
         "data_snapshot_hash": data_snapshot_hash,
         "config": config,
-        "evaluation_results": evaluation_results
+        "evaluation_results": evaluation_results,
+        "stress_results": stress_results,
+        "duplicate_results": duplicate_results,
+        "suitability_results": suitability_results,
+        "engine_version": engine_version
     }, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 ```
 
-**report_hash 计算：** evidence_hash + AI 解释文本的 SHA256
+**report_hash 计算：** `evidence_hash` + 确定性正式报告载荷的 SHA256；任何 AI 文本、供应商、模型和降级原因均不参与计算。可选 AI 辅助解读使用独立 `ai_analysis_hash`。
 
 ---
 
@@ -732,32 +746,30 @@ with st.sidebar:
         ["A股", "港股 (即将支持)", "美股 (即将支持)", "加密货币 (即将支持)", "外汇 (即将支持)"],
         index=0
     )
-    time_range = st.selectbox(
-        "时间范围",
-        ["全量 (2019-2026)", "近3年", "近5年", "自定义..."]
-    )
+    st.caption("比赛快照（2024-09-27 至 2025-09-26）")
 
     st.divider()
-    st.markdown("### 内置因子库 (8+ 预置)")
+    st.markdown("### 因子库（800 个内置标准因子）")
     # 因子库分类展示
     st.divider()
     st.markdown("### 因子导入")
     st.markdown("- 文本描述")
     st.markdown("- 受限公式")
     st.markdown("- 上传因子值")
-    st.markdown("- Python脚本 *(即将支持)*")
+    st.caption("安全边界：不执行用户上传的 Python 脚本")
     st.divider()
     st.markdown("*研究质量基础设施*")
     st.markdown("*不输出交易信号*")
 ```
 
-### 6.2 页面一：工作台（01_工作台.py）
+### 6.2 页面一：首页（app.py）
 
 **核心组件：**
 - `st.button("新建鉴证")` → 跳转到因子输入页
-- 最近运行列表：从 SQLite 读取 audit_runs 表
+- 最近运行列表：优先从 DuckDB `audit_runs` 读取，并在当前会话中保留最近结果缓存
 - 四个 Demo 入口卡片（Demo A/B/C/D）
 - 数据快照状态显示
+- 首页与原工作台已合并，侧栏不再保留重复的独立工作台页面
 
 ### 6.3 页面二：因子输入（02_因子输入.py）
 
@@ -904,7 +916,7 @@ fig = px.imshow(
 app.py
     ├── data_loader.py
     │   ├── 检查 data/snapshot/daily_ohlcv.parquet 是否存在
-    │   ├── 不存在 → 遍历 H:\data\stock-trading-data-pro\*.csv
+    │   ├── 不存在 → 遍历 E:\Quantclass\stock-trading-data-pro\*.csv
     │   │   ├── GBK 编码读取 + 列名标准化
     │   │   ├── 合并为 daily_ohlcv.parquet + daily_basic.parquet + stock_basic.parquet
     │   │   └── 可选：通过 akshare/baostock 补充 ST 状态和退市日期
@@ -912,10 +924,10 @@ app.py
     │
     └── factor_loader.py
         ├── 扫描 Factors/*/factor_index.json
-        ├── 解析因子元数据 → SQLite factor_metadata
+        ├── 解析因子元数据 → DuckDB factor_metadata
         ├── 扫描 Factors/*/validation_summary_real.json
         │   ├── 提取 ic_mean_5d, icir_5d, coverage, turnover, status
-        │   └── 写入 SQLite precomputed_results
+        │   └── 写入 DuckDB precomputed_results
         └── 返回可用因子列表
 
 内置因子 Demo 数据：
@@ -963,7 +975,7 @@ app.py
     ├── 步骤 8: 哈希计算
     │   └── evidence_hash + report_hash
     └── 步骤 9: 结果持久化
-        └── 写入 SQLite audit_runs 表
+        └── 写入 DuckDB audit_runs 表
 ```
 
 ---
@@ -974,9 +986,9 @@ app.py
 
 | 层级 | 来源 | 字段 | 策略 |
 |---|---|---|---|
-| 主数据源 | 本地 CSV `H:\data\stock-trading-data-pro` | OHLCV、市值、PE/PB、行业分类、指数成分股 | 首次启动时合并为 Parquet 快照，后续秒级加载 |
+| 主数据源 | 本地 CSV `E:\Quantclass\stock-trading-data-pro` | OHLCV、市值、换手率、利润/现金流、资产负债、行业分类 | 通过显式 CLI 流式转换为 Parquet；页面不自动建库 |
 | 补充数据源 | akshare / baostock | ST 状态、退市日期、复权因子 | 按需调用，缓存到本地，接口不可用时降级处理 |
-| 预计算指标 | Factors/*/validation_summary_real.json | IC、ICIR、覆盖率、换手率 | 直接读取 JSON，写入 SQLite 缓存 |
+| 预计算指标 | Factors/*/validation_summary_real.json | IC、ICIR、覆盖率、换手率 | 直接读取 JSON，写入 DuckDB 缓存 |
 
 ### 8.2 内置因子展示（无需计算）
 
@@ -996,12 +1008,12 @@ MVP 利用现有 validation_summary_real.json 中的预计算指标，直接展�
 |---|---|---|
 | Demo A | 选择一个 status="pass" 的因子 | 在 formula 中写入 delay=-1，触发时间正确性失败 |
 | Demo B | 选择 R001 和 R034（5日动量 vs 5日delta动量） | 两者公式结构相似但命名不同，触发重复检测 |
-| Demo C | 选择一个 ic_mean_5d 较高的小盘因子 | 在压力测试中手动设置剔除微盘后 RankIC 显著下降 |
-| Demo D | 参考 ai-berkshire quality-screen 的 7 条去劣指标 | 选取 B 级代理（ROE 稳定性、净利率、股本变化）构建可验证因子，其余标为"不可鉴证" |
+| Demo C | 选择 R072 | 展示剔除微盘和市值中性化测试；无实时数据时明确标为演示/未测试 |
+| Demo D | 参考 ai-berkshire quality-screen 的 7 条去劣指标 | 资本效率代理可进入实时鉴证；缺少公告时点会被证据引擎限制为 `insufficient`，其余代理保持不可鉴证 |
 
 ### 8.4 预计算指标 vs 实时计算
 
-- **MVP 阶段：** 内置因子直接使用预计算指标展示，不执行实时计算
+- **内置因子：** 有正式行情快照时按 base/transform 契约实时计算；无快照时只展示历史预计算摘要
 - **文本描述/公式因子：** 基于本地数据执行完整的实时计算流程
 - **上传因子值：** 执行质检 + 传统评估 + 压力测试
 - **Demo 因子：** 混合使用预计算数据 + 手动构造的异常数据
@@ -1029,12 +1041,12 @@ streamlit>=1.28.0
 plotly>=5.18.0
 pandas>=2.1.0
 numpy>=1.26.0
+scipy>=1.11.0
 lark>=1.1.0
 pydantic>=2.5.0
 pyarrow>=14.0.0
 openpyxl>=3.1.0
-akshare>=1.14.0
-baostock>=0.8.8
+duckdb>=1.0.0
 ```
 
 ### 9.2 setup.bat（Windows 一键初始化）
@@ -1076,14 +1088,14 @@ venv\Scripts\activate.bat
 streamlit run app.py
 
 # 或指定端口
-streamlit run app.py --server.port 8501 --server.address localhost
+streamlit run app.py --server.port 8501 --server.address 0.0.0.0
 ```
 
 ---
 
 ## 10. 关键设计决策
 
-### 10.1 为什么用 SQLite 而不是纯文件？
+### 10.1 为什么用 DuckDB 而不是纯文件？
 
 - 因子元数据查询需要分类筛选、排序、模糊搜索，SQL 比文件扫描更高效
 - 鉴证运行记录需要持久化历史，支持"最近运行"列表
@@ -1108,9 +1120,9 @@ streamlit run app.py --server.port 8501 --server.address localhost
 
 ### 10.5 为什么主数据源用本地 CSV 而不是 TuShare？
 
-- 本地数据集已覆盖 A 股全量日线行情（沪深京三地），包含 OHLCV、市值、PE/PB 和行业分类
+- 本地数据集已覆盖 A 股全量日线行情（沪深京三地），包含 OHLCV、市值、换手率、利润/现金流、资产负债和行业分类；不含 PE/PB
 - 零网络依赖，无 API 调用频率限制，适合离线 Demo 演示
-- 首次启动合并为 Parquet 快照后，后续加载秒级完成
+- 显式构建 Parquet 快照后，后续加载秒级完成；页面启动不会隐式扫描 CSV
 - 缺失字段（ST 状态、退市日期、复权因子）通过免费三方数据源按需补充，且均有降级方案
 
 ---
@@ -1156,4 +1168,20 @@ streamlit run app.py --server.port 8501 --server.address localhost
 
 ---
 
-> **文档版本：** 1.0 | **编写日期：** 2026-08-16 | **对应 PRD：** FactorGuard_PRD_V1.1
+## 9. AI 辅助解读隔离契约
+
+`engine/ai_analysis.py` 是非权威 sidecar。它只接收结构化证据摘要，不接收原始 DataFrame、本地路径或 API Key；Pydantic 模型拒绝未知字段。模型输出必须保持正式结论不变，只能引用输入中存在的 `evidence_id`，且文本中的数字必须来自证据内容。
+
+模型不可用、超时、网络错误、非 JSON、结构错误、结论冲突、引用错误或数字校验失败时，统一生成确定性的 `rule_fallback`。成功结果标记 `model`。`ai_analysis_hash` 独立覆盖证据哈希、供应商、模型、提示词版本和经校验的 AI 载荷；正式 `report_hash` 永不覆盖 AI 文本。
+
+模型适配采用 OpenAI-compatible Chat Completions。内置 `openai`、`deepseek`、`dashscope`、`zhipu`、`moonshot`、`siliconflow` 和 `custom` 七种供应商配置。非敏感字段按“页面显式值 > `FACTORGUARD_LLM_*` 环境覆盖 > 供应商预设”解析；未声明供应商的旧版 Base URL/模型配置按 `custom` 保持兼容。页面可选择供应商、编辑模型 ID，并仅在自定义模式下填写 Base URL。
+
+`FACTORGUARD_LLM_API_KEY` 是唯一密钥来源。报告页只调用布尔状态函数，不读取或保存密钥；配置对象的调试表示、请求正文、AI 返回结果、session state、日志与哈希均不包含密钥。缺少密钥、不支持的供应商、非法 URL 或不完整自定义配置直接规则降级。
+
+报告页把 AI 结果保留在 Streamlit session state，不写入 `audit_runs` 正式字段；HTML、Markdown、JSON 三种下载只包含确定性审计结果，按钮数量固定为 3。
+
+正式报告由确定性审计引擎生成；大模型只提供可引用、可校验、可降级的投研辅助解读，不参与正式裁决。
+
+---
+
+> **文档版本：** 1.1 | **更新日期：** 2026-08-21 | **对应 PRD：** FactorGuard_PRD_V1.1

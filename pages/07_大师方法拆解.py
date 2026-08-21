@@ -1,7 +1,9 @@
 import streamlit as st
 import pandas as pd
 from models.master_method import MasterMethodSpec, Principle
+from models.factor_spec import FactorSpec
 from engine.master_method_loader import load_demo_master_method
+from engine.session_context import select_factor
 from ui.metric_cards import render_verdict_badge
 from ui.color_utils import COLOR_SCHEME
 
@@ -97,7 +99,7 @@ with t2:
         })
 
     df = pd.DataFrame(rows)
-    st.dataframe(df, width='stretch', hide_index=True)
+    st.dataframe(df, width="stretch", hide_index=True)
 
     st.markdown("---")
     st.subheader("🛡️ 3 条豁免规则")
@@ -121,7 +123,7 @@ with t2:
 # ═══════════════════════════════════════════════
 with t3:
     st.subheader("🔬 代理因子映射表")
-    st.caption("B 级代理可送检因子评估流程，C/U 级代理因数据不足暂不可鉴证。")
+    st.caption("资本效率代理已可送检；其余代理因字段或时点不足保持不可鉴证。")
 
     proxy_rows = []
     for p in method.principles:
@@ -133,9 +135,12 @@ with t3:
             "U": COLOR_SCHEME["untested"],
         }.get(p.proxy_grade, COLOR_SCHEME["untested"])
 
-        if p.proxy_grade in ("B",):
-            status = "🟢 可送检"
+        if p.id == 1:
+            status = "🟡 可计算·时点待核验"
             action = "送检"
+        elif p.proxy_grade in ("B",):
+            status = "🟠 待实现"
+            action = "—"
         elif p.proxy_grade in ("A",):
             status = "✅ 已验证"
             action = "查看"
@@ -180,12 +185,40 @@ with t3:
             if row["操作"] == "送检":
                 if st.button("🔍 送检", key=f"audit_{i}", type="primary",
                           help="跳转到因子评估流程"):
-                    st.session_state["selected_factor_id"] = f"master_{method.method_id}_p{row['原则']}"
-                    st.switch_page("pages/03_传统评估.py")
+                    factor_id = f"master_{method.method_id}_capital_efficiency"
+                    spec = FactorSpec(
+                        factor_id=factor_id,
+                        name=factor_id,
+                        name_cn="资本效率代理（净利润TTM/净资产）",
+                        description=(
+                            f"{method.name}：{row['原则']}的可计算代理。"
+                            "源数据缺少财务公告日期，时间正确性必须保持未测试。"
+                        ),
+                        formula="rank_cs(net_profit_ttm / net_assets)",
+                        base="master_proxy",
+                        category="质量",
+                        expected_direction="higher",
+                        inputs=["net_profit_ttm", "net_assets"],
+                        availability="financial_period_end_unverified",
+                        min_window=1,
+                        source="master_proxy",
+                    )
+                    select_factor(st.session_state, spec)
+                    st.switch_page("pages/09_鉴证运行.py")
             elif row["操作"] == "查看":
                 if st.button("📋 查看", key=f"view_{i}",
                           help="查看已有验证结果"):
-                    st.session_state["selected_factor_id"] = f"master_{method.method_id}_p{row['原则']}"
+                    factor_id = f"master_{method.method_id}_p{i + 1}"
+                    spec = FactorSpec(
+                        factor_id=factor_id,
+                        name=factor_id,
+                        name_cn=str(row["代理因子"]),
+                        description=f"{method.name}：{row['原则']}的代理因子",
+                        base="master_proxy",
+                        category="质量",
+                        source="master_proxy",
+                    )
+                    select_factor(st.session_state, spec)
                     st.switch_page("pages/03_传统评估.py")
             else:
                 st.text("—")
@@ -194,8 +227,8 @@ with t3:
 
     st.markdown("---")
     st.info(
-        "💡 **送检说明**：点击「送检」按钮将跳转到因子评估流程，基于本地数据对代理因子进行"
-        "可行性、预测力、稳定性三维评估。C/U 级代理因子因数据缺失暂不可送检，需先补充数据源。"
+        "💡 **代理说明**：A/B/C/U 是方法映射的数据可得性评级，不等于 FactorGuard 鉴证结论。"
+        "需先实现财务字段、披露时点和代理公式契约，才能进入实时评估。"
     )
 
 # ═══════════════════════════════════════════════

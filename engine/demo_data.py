@@ -8,23 +8,18 @@ Demo 数据构造模块
 - Demo D: 大师方法（巴菲特质量框架及其代理因子）
 """
 
-from engine.factor_loader import get_all_factors, get_factor_by_id, get_precomputed_metrics, load_all_factors
+from engine.factor_loader import get_all_factors, get_factor_by_id, get_precomputed_metrics
 from engine.master_method_loader import load_demo_master_method
 from models.factor_spec import FactorSpec
-from config import FACTORS_DIR
 
 
 # ---------------------------------------------------------------------------
-# 内部辅助：确保因子库已加载到 DB，否则从因子目录加载
+# 内部辅助：加载只读因子目录和可选的本地 DB 扩展
 # ---------------------------------------------------------------------------
 
 def _ensure_factors_loaded() -> list[FactorSpec]:
-    """确保因子数据库已初始化，返回所有因子列表。"""
-    factors = get_all_factors()
-    if not factors:
-        load_all_factors(FACTORS_DIR)
-        factors = get_all_factors()
-    return factors
+    """返回因子列表；首次启动不要求预置 DuckDB。"""
+    return get_all_factors()
 
 
 # ---------------------------------------------------------------------------

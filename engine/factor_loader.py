@@ -1,4 +1,5 @@
 import json
+import hashlib
 import duckdb
 import pandas as pd
 from pathlib import Path
@@ -185,6 +186,91 @@ def _factor_index_to_spec(factor: dict) -> FactorSpec:
     )
 
 
+def _iter_builtin_specs_from_files(factors_root: Path = None) -> list[FactorSpec]:
+    """直接从因子仓库文件加载规格，作为 DuckDB 不可用时的兜底。"""
+    if factors_root is None:
+        factors_root = FACTORS_DIR
+
+    specs: list[FactorSpec] = []
+    for repo_name in SKILL_REPOS:
+        skill_dir = factors_root / repo_name
+        if not skill_dir.is_dir():
+            continue
+        index_items = load_factor_index(skill_dir)
+        specs.extend(_factor_index_to_spec(item) for item in index_items)
+    return specs
+
+
+def _demo_specs() -> list[FactorSpec]:
+    return [
+        FactorSpec(
+            factor_id=demo["factor_id"],
+            name=demo["factor_id"],
+            name_cn=demo["name_cn"],
+            version="1.0.0",
+            description=demo["description"],
+            category=demo["category"],
+            expected_direction=demo["expected_direction"],
+            base=demo["base"],
+            transform=demo["transform"],
+            params=demo["params"],
+            inputs=[],
+            frequency="1d",
+            availability="after_close",
+            availability_lag=1,
+            min_window=abs(demo["params"].get("window", 20)),
+            universe_rule="historical_all_a",
+            source=demo["source"],
+        )
+        for demo in DEMO_FACTORS
+    ]
+
+
+def _master_proxy_spec() -> FactorSpec:
+    factor_id = "master_berkshire-quality_capital_efficiency"
+    return FactorSpec(
+        factor_id=factor_id,
+        name=factor_id,
+        name_cn="资本效率代理（净利润TTM/净资产）",
+        description=(
+            "巴菲特质量框架（去劣筛选）：资本效率的可计算代理。"
+            "源数据缺少财务公告日期，时间正确性必须保持未测试。"
+        ),
+        formula="rank_cs(net_profit_ttm / net_assets)",
+        base="master_proxy",
+        category="质量",
+        expected_direction="higher",
+        inputs=["net_profit_ttm", "net_assets"],
+        availability="financial_period_end_unverified",
+        min_window=1,
+        source="master_proxy",
+    )
+
+
+def _default_factor_specs(factors_root: Path = None) -> list[FactorSpec]:
+    return _iter_builtin_specs_from_files(factors_root) + _demo_specs() + [
+        _master_proxy_spec()
+    ]
+
+
+def _raw_validation_to_metrics(val: dict) -> dict:
+    """将 validation_summary_real.json 原始字段转成页面使用的指标结构。"""
+    return {
+        "ic_mean_5d": val.get("ic_mean_5d"),
+        "ic_std_5d": val.get("ic_std_5d"),
+        "icir_5d": val.get("icir_5d"),
+        "ic_observations": val.get("ic_observations"),
+        "long_short_mean_5d": val.get("long_short_mean_5d"),
+        "long_short_observations": val.get("long_short_observations"),
+        "coverage": val.get("coverage"),
+        "turnover": val.get("turnover_top_quintile"),
+        "sample_rows": val.get("sample_rows"),
+        "usable_rows": val.get("usable_rows"),
+        "status": val.get("status"),
+        "no_future_check": val.get("no_future_check"),
+    }
+
+
 def load_all_factors(factors_root: Path = None) -> list[FactorSpec]:
     if factors_root is None:
         factors_root = FACTORS_DIR
@@ -212,27 +298,8 @@ def load_all_factors(factors_root: Path = None) -> list[FactorSpec]:
             if val:
                 _insert_precomputed_metrics(conn, spec.factor_id, val, now)
 
-    # 加载 Demo 因子
-    for demo in DEMO_FACTORS:
-        spec = FactorSpec(
-            factor_id=demo["factor_id"],
-            name=demo["factor_id"],
-            name_cn=demo["name_cn"],
-            version="1.0.0",
-            description=demo["description"],
-            category=demo["category"],
-            expected_direction=demo["expected_direction"],
-            base=demo["base"],
-            transform=demo["transform"],
-            params=demo["params"],
-            inputs=[],
-            frequency="1d",
-            availability="after_close",
-            availability_lag=1,
-            min_window=abs(demo["params"].get("window", 20)),
-            universe_rule="historical_all_a",
-            source=demo["source"],
-        )
+    # 加载 Demo 和大师代理因子
+    for spec in _demo_specs() + [_master_proxy_spec()]:
         all_specs.append(spec)
         _insert_factor_metadata(conn, spec, now)
 
@@ -302,68 +369,87 @@ def _insert_precomputed_metrics(conn, factor_id: str, val: dict, now: str) -> No
 
 
 def get_factor_by_id(factor_id: str) -> Optional[FactorSpec]:
-    conn = _get_conn()
-    result = conn.execute(
-        "SELECT spec_json FROM factor_metadata WHERE factor_id = ?", [factor_id]
-    ).fetchone()
-    conn.close()
+    if DB_PATH.is_file():
+        try:
+            conn = _get_conn()
+            result = conn.execute(
+                "SELECT spec_json FROM factor_metadata WHERE factor_id = ?", [factor_id]
+            ).fetchone()
+            conn.close()
+            if result is not None:
+                return FactorSpec.model_validate_json(result[0])
+        except Exception:
+            pass
 
-    if result is not None:
-        return FactorSpec.model_validate_json(result[0])
-
-    # DB 中未找到，检查 Demo 因子
-    for demo in DEMO_FACTORS:
-        if demo["factor_id"] == factor_id:
-            return FactorSpec(
-                factor_id=demo["factor_id"],
-                name=demo["factor_id"],
-                name_cn=demo["name_cn"],
-                version="1.0.0",
-                description=demo["description"],
-                category=demo["category"],
-                expected_direction=demo["expected_direction"],
-                base=demo["base"],
-                transform=demo["transform"],
-                params=demo["params"],
-                inputs=[],
-                frequency="1d",
-                availability="after_close",
-                availability_lag=1,
-                min_window=abs(demo["params"].get("window", 20)),
-                universe_rule="historical_all_a",
-                source=demo["source"],
-            )
-
+    for spec in _default_factor_specs():
+        if spec.factor_id == factor_id:
+            return spec
     return None
 
 
 def get_all_factors(category: str = None) -> list[FactorSpec]:
-    conn = _get_conn()
+    """Load the read-only catalog first and overlay optional local DB records."""
+    specs_by_id = {spec.factor_id: spec for spec in _default_factor_specs()}
+    if DB_PATH.is_file():
+        try:
+            conn = _get_conn()
+            df = conn.execute("SELECT spec_json FROM factor_metadata").df()
+            conn.close()
+            for value in df.get("spec_json", []):
+                spec = FactorSpec.model_validate_json(value)
+                specs_by_id[spec.factor_id] = spec
+        except Exception:
+            pass
+
+    specs = list(specs_by_id.values())
     if category:
-        df = conn.execute(
-            "SELECT spec_json FROM factor_metadata WHERE category = ? ORDER BY factor_id",
-            [category],
-        ).df()
-    else:
-        df = conn.execute(
-            "SELECT spec_json FROM factor_metadata ORDER BY factor_id"
-        ).df()
-    conn.close()
-    return [FactorSpec.model_validate_json(r) for r in df["spec_json"]]
+        specs = [spec for spec in specs if spec.category == category]
+    return sorted(
+        specs,
+        key=lambda spec: (getattr(spec, "source", "") == "demo", spec.factor_id),
+    )
 
 
 def get_precomputed_metrics(factor_id: str) -> dict:
-    conn = _get_conn()
-    df = conn.execute(
-        "SELECT metric_name, metric_value, metric_meta FROM precomputed_results WHERE factor_id = ?",
-        [factor_id],
-    ).df()
-    conn.close()
-    result = {}
-    for _, r in df.iterrows():
-        if r["metric_value"] is not None and not (isinstance(r["metric_value"], float) and pd.isna(r["metric_value"])):
-            result[r["metric_name"]] = r["metric_value"]
-        elif r["metric_meta"] is not None:
-            meta = json.loads(r["metric_meta"])
-            result[r["metric_name"]] = meta.get("raw")
-    return result
+    if DB_PATH.is_file():
+        try:
+            conn = _get_conn()
+            df = conn.execute(
+                "SELECT metric_name, metric_value, metric_meta FROM precomputed_results WHERE factor_id = ?",
+                [factor_id],
+            ).df()
+            conn.close()
+            result = {}
+            for _, r in df.iterrows():
+                if r["metric_value"] is not None and not (isinstance(r["metric_value"], float) and pd.isna(r["metric_value"])):
+                    result[r["metric_name"]] = r["metric_value"]
+                elif r["metric_meta"] is not None:
+                    meta = json.loads(r["metric_meta"])
+                    result[r["metric_name"]] = meta.get("raw")
+            if result:
+                return result
+        except Exception:
+            pass
+
+    for repo_name in SKILL_REPOS:
+        skill_dir = FACTORS_DIR / repo_name
+        if not skill_dir.is_dir():
+            continue
+        validation = load_validation_summary(skill_dir)
+        raw = validation.get(factor_id)
+        if raw:
+            return _raw_validation_to_metrics(raw)
+    return {}
+
+
+def get_precomputed_source_hash(factor_id: str) -> str:
+    """Hash the exact validation record used as a precomputed data source."""
+    for repo_name in SKILL_REPOS:
+        skill_dir = FACTORS_DIR / repo_name
+        if not skill_dir.is_dir():
+            continue
+        raw = load_validation_summary(skill_dir).get(factor_id)
+        if raw:
+            payload = json.dumps(raw, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+            return "precomputed:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return "unavailable"

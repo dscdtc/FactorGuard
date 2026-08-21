@@ -19,6 +19,7 @@ from engine.factor_computer import load_aligned_data
 from engine.factor_loader import get_precomputed_metrics
 from engine.data_loader import get_ohlcv_data, get_basic_data
 from engine.run_recorder import save_run
+from engine.session_context import build_cache_context, contextual_cache_key, set_audit_result
 from ui.chart_utils import (
     create_rolling_ic_chart, create_group_return_chart,
     create_distribution_chart, create_coverage_chart,
@@ -34,6 +35,84 @@ st.set_page_config(page_title="传统评估", page_icon="\U0001f4ca", layout="wi
 # ============================================================
 # 辅助函数
 # ============================================================
+def render_precomputed_fallback(factor_id: str, factor_name: str, precomputed: dict):
+    """当本地实时数据不可用时，展示预计算参考指标并允许继续查看报告。"""
+    st.warning("⚠️ 当前环境未加载本地行情数据，已切换为内置因子的预计算结果展示。")
+
+    metrics = [
+        {
+            "label": "IC Mean (5D)",
+            "value": f"{precomputed.get('ic_mean_5d', 0):.4f}",
+            "help_text": "来自内置因子 validation_summary_real.json 的预计算指标",
+        },
+        {
+            "label": "ICIR",
+            "value": f"{precomputed.get('icir_5d', 0):.4f}",
+            "help_text": "来自内置因子 validation_summary_real.json 的预计算指标",
+        },
+        {
+            "label": "覆盖率",
+            "value": f"{precomputed.get('coverage', 0):.2%}",
+            "help_text": "预计算结果中的样本覆盖率",
+        },
+        {
+            "label": "换手率",
+            "value": f"{precomputed.get('turnover', 0):.2%}",
+            "help_text": "预计算结果中的分组换手率",
+        },
+    ]
+    render_metric_row(metrics)
+
+    st.markdown("---")
+    st.subheader("预计算参考摘要")
+    summary_df = pd.DataFrame(
+        [
+            {"指标": "Long-Short Mean (5D)", "数值": f"{precomputed.get('long_short_mean_5d', 0):.4f}"},
+            {"指标": "样本行数", "数值": f"{int(precomputed.get('sample_rows', 0) or 0):,}"},
+            {"指标": "有效行数", "数值": f"{int(precomputed.get('usable_rows', 0) or 0):,}"},
+            {"指标": "未来函数检查", "数值": "通过" if precomputed.get("no_future_check") else "未验证"},
+            {"指标": "验证状态", "数值": str(precomputed.get("status", "N/A"))},
+        ]
+    )
+    st.dataframe(summary_df, width="stretch", hide_index=True)
+
+    # 写回 session_state，保证报告页可直接消费
+    fallback_eval = {
+        "status": "precomputed",
+        "source": "precomputed",
+        "ic_mean": precomputed.get("ic_mean_5d", 0.0),
+        "rank_ic_mean": precomputed.get("ic_mean_5d", 0.0),
+        "icir": precomputed.get("icir_5d", 0.0),
+        "direction_consistency": 0.0,
+        "coverage": precomputed.get("coverage", 0.0),
+        "sample_count": int(precomputed.get("usable_rows", precomputed.get("sample_rows", 0)) or 0),
+        "ic_p_value": None,
+        "max_delay": (
+            1 if precomputed.get("no_future_check") is True
+            else (-1 if precomputed.get("no_future_check") is False else None)
+        ),
+    }
+    st.session_state["eval_results"] = fallback_eval
+    set_audit_result(st.session_state, "traditional_eval", fallback_eval)
+
+    save_run(
+        factor_name,
+        factor_id,
+        "insufficient",
+        f"使用预计算参考结果，ICIR: {fallback_eval['icir']:.4f}，覆盖率: {fallback_eval['coverage']:.1%}",
+        st.session_state,
+    )
+
+    st.info("已写入可兼容的评估结果，你现在可以继续进入“报告与凭证”页面查看完整报告。")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("📋 前往报告与凭证", type="primary", width="stretch"):
+            st.switch_page("pages/08_报告与凭证.py")
+    with col2:
+        if st.button("📥 返回因子输入", width="stretch"):
+            st.switch_page("pages/02_因子输入.py")
+
+
 def evaluate_by_time_dimension_custom(df: pd.DataFrame, period_col: str) -> pd.DataFrame:
     """按自定义分段聚合指标"""
     from engine.traditional_eval import evaluate_factor
@@ -197,6 +276,19 @@ if time_range not in ("自定义起止日期", "样本外预留") and time_dim !
 # 数据获取与评估计算（优化版：预计算 + 并行 + 渐进式UI）
 # ============================================================
 forward_period = st.session_state.get("forward_period", 5)
+evaluation_config = {
+    "forward_period": int(forward_period),
+    "time_range": time_range,
+    "custom_start": custom_start,
+    "custom_end": custom_end,
+    "oos_ratio": oos_ratio,
+    "time_dimension": time_dim,
+    "custom_dimension_periods": custom_dim_periods,
+    "bootstrap_block_size": DEFAULT_BOOTSTRAP_BLOCKS,
+    "bootstrap_reps": DEFAULT_BOOTSTRAP_REPS,
+    "bootstrap_seed": DEFAULT_BOOTSTRAP_SEED,
+}
+st.session_state["evaluation_config"] = evaluation_config
 t_start = time.time()
 
 # 尝试加载对齐数据（自动从 OHLCV 快照计算）
@@ -204,7 +296,14 @@ with st.spinner("正在加载和计算因子数据..."):
     aligned_data = load_aligned_data(st.session_state, forward_period)
 
 if aligned_data is None or aligned_data.empty:
-    st.warning("\u26a0\ufe0f 未找到对齐后的因子数据，请先在因子输入页面选择因子")
+    if precomputed:
+        render_precomputed_fallback(factor_id, factor_name, precomputed)
+    else:
+        detail = st.session_state.get("alignment_error")
+        message = "\u26a0\ufe0f 未找到对齐后的因子数据"
+        if detail:
+            message += f"：{detail}"
+        st.warning(message)
     st.stop()
 
 # 时间范围过滤
@@ -240,7 +339,8 @@ if df.empty:
 # ============================================================
 # 缓存检查：避免重复计算
 # ============================================================
-cache_key = f"eval_{factor_id}_{time_range}"
+cache_context = build_cache_context(st.session_state, **evaluation_config)
+cache_key = contextual_cache_key("eval", cache_context)
 cached = st.session_state.get(cache_key)
 
 if cached is not None:
@@ -341,6 +441,7 @@ else:
 
         # 缓存计算结果
         st.session_state[cache_key] = {
+            "context": cache_context,
             "eval_result": eval_result,
             "boot_result": boot_result,
             "daily_ric": daily_ric,
@@ -366,6 +467,12 @@ else:
                   f"RankIC: {rank_ic:.4f}, ICIR: {icir_val:.4f}, "
                   f"覆盖率: {eval_result.get('coverage', 0):.1%}",
                   st.session_state)
+
+# 实时结果也必须进入统一审计状态，供压力测试和报告消费。
+eval_result["status"] = "computed"
+eval_result["source"] = "computed"
+st.session_state["eval_results"] = eval_result
+set_audit_result(st.session_state, "traditional_eval", eval_result)
 
 # ============================================================
 # 指标卡片行（核心指标立即展示）
@@ -430,7 +537,7 @@ with chart_col1:
             rolling_rank_ic=rolling_ic['rolling_rank_ic'],
             title="滚动 RankIC（63日窗口）"
         )
-        st.plotly_chart(fig_ric, width='stretch')
+        st.plotly_chart(fig_ric, width="stretch")
     else:
         st.info("数据不足，无法计算滚动 RankIC")
 
@@ -442,7 +549,7 @@ with chart_col2:
             returns=group_returns,
             title="分组平均收益"
         )
-        st.plotly_chart(fig_gr, width='stretch')
+        st.plotly_chart(fig_gr, width="stretch")
     else:
         st.info("数据不足，无法计算分组收益")
 
@@ -459,7 +566,7 @@ with dist_col1:
             dist_result['factor_values'],
             title="因子值分布"
         )
-        st.plotly_chart(fig_dist, width='stretch')
+        st.plotly_chart(fig_dist, width="stretch")
     else:
         st.info("数据不足，无法绘制因子值分布")
 
@@ -470,7 +577,7 @@ with dist_col2:
             dist_result['coverage_values'],
             title="覆盖率时间序列"
         )
-        st.plotly_chart(fig_cov, width='stretch')
+        st.plotly_chart(fig_cov, width="stretch")
     else:
         st.info("数据不足，无法绘制覆盖率时间序列")
 
@@ -488,7 +595,7 @@ with decay_col1:
             ic_values=decay_result['rank_ic_values'],
             title="RankIC 衰减（不同预测周期）"
         )
-        st.plotly_chart(fig_decay, width='stretch')
+        st.plotly_chart(fig_decay, width="stretch")
     else:
         st.info("数据不足，无法计算 IC 衰减")
 
@@ -522,7 +629,7 @@ with cum_col1:
             labels=["G1 (低)", "G2", "G3", "G4", "G5 (高)"],
             title="分组累计收益"
         )
-        st.plotly_chart(fig_cum, width='stretch')
+        st.plotly_chart(fig_cum, width="stretch")
     else:
         st.info("数据不足，无法计算累计收益")
 
@@ -545,7 +652,7 @@ with auto_col1:
             autocorr_values=autocorr_result['autocorr_values'],
             title="因子自相关（跨股票均值）"
         )
-        st.plotly_chart(fig_auto, width='stretch')
+        st.plotly_chart(fig_auto, width="stretch")
     else:
         st.info("数据不足，无法计算因子自相关")
 
@@ -596,7 +703,7 @@ detail_data = {
 }
 
 detail_df = pd.DataFrame(detail_data)
-st.dataframe(detail_df, width='stretch', hide_index=True)
+st.dataframe(detail_df, width="stretch", hide_index=True)
 
 # ============================================================
 # 分组收益明细
@@ -607,7 +714,7 @@ group_data = {
     "分组": group_labels,
     "平均收益": [f"{r:.4f}" for r in eval_result['group_returns']],
 }
-st.dataframe(pd.DataFrame(group_data), width='stretch', hide_index=True)
+st.dataframe(pd.DataFrame(group_data), width="stretch", hide_index=True)
 
 # ============================================================
 # 时间维度聚合
@@ -616,7 +723,7 @@ st.markdown("---")
 st.markdown(f"### \U0001f4c5 按{time_dim}度指标")
 
 if not time_dim_df.empty:
-    st.dataframe(time_dim_df, width='stretch', hide_index=True)
+    st.dataframe(time_dim_df, width="stretch", hide_index=True)
 else:
     st.info("数据不足，无法按时间维度聚合")
 

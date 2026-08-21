@@ -51,6 +51,8 @@ GRAMMAR = r"""
 FIELD_WHITELIST = {
     'open', 'high', 'low', 'close', 'volume', 'amount',
     'total_mv', 'circ_mv', 'turnover_rate', 'pe_ttm',
+    'net_profit_ttm', 'cash_flow_ttm', 'total_assets', 'net_assets',
+    'total_liability', 'net_profit_quarter',
 }
 
 FUNCTION_WHITELIST = {

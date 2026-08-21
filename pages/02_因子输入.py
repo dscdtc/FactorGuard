@@ -1,8 +1,7 @@
-"""
-FactorGuard 因子输入页面 - 5 种因子引入方式
-"""
+"""FactorGuard 因子输入页面 - 4 种安全的因子引入方式。"""
 import streamlit as st
 import pandas as pd
+import re
 
 from config import (
     COLOR_PASS, COLOR_WARN, COLOR_FAIL, COLOR_NEUTRAL, DATA_SNAPSHOT,
@@ -11,6 +10,7 @@ from models.factor_spec import FactorSpec
 from engine.factor_loader import get_all_factors, get_precomputed_metrics
 from engine.ai_explainer import parse_text_to_spec
 from engine.formula_parser import FormulaParser
+from engine.session_context import select_factor
 from ui.color_utils import get_verdict_color
 
 
@@ -27,10 +27,50 @@ def init_session():
             st.session_state[key] = val
 
 
+def _safe_factor_id(prefix: str, name: str) -> str:
+    slug = re.sub(r"[^0-9A-Za-z_\u4e00-\u9fff]+", "_", name).strip("_") or "factor"
+    return f"{prefix}_{slug}"[:80]
+
+
+def _custom_spec(factor_id: str, name_cn: str, formula: str, *, category="其他",
+                 direction="higher", params=None, inputs=None, rationale=None) -> FactorSpec:
+    parsed = FormulaParser().parse(formula)
+    return FactorSpec(
+        factor_id=factor_id,
+        name=factor_id,
+        name_cn=name_cn,
+        description=rationale or "用户自定义因子",
+        formula=formula,
+        formula_cn=rationale,
+        expected_direction=direction,
+        category=category,
+        base="custom_formula",
+        params=params or {},
+        inputs=inputs or parsed.used_fields,
+        min_window=max(1, parsed.max_window),
+        source="custom",
+        rationale_cn=rationale,
+    )
+
+
 def tab_builtin():
     """标签页 1: 内置因子"""
     st.markdown("### 内置因子库")
     st.markdown("*从预先计算好的因子库中选择因子进行验真*")
+
+    selected_factor_id = st.session_state.get("selected_factor_id")
+    selected_factor_name = st.session_state.get("selected_factor_name")
+    if selected_factor_id and selected_factor_name:
+        with st.container(border=True):
+            st.success(f"已选择因子：{selected_factor_name}（{selected_factor_id}）")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("🚀 进入传统评估", key="goto_trad_eval", type="primary", width="stretch"):
+                    st.switch_page("pages/03_传统评估.py")
+            with col_b:
+                if st.button("⚙️ 进入鉴证运行", key="goto_audit_run", width="stretch"):
+                    st.switch_page("pages/09_鉴证运行.py")
+        st.markdown("---")
 
     # 加载因子列表
     if not st.session_state.get("all_factors"):
@@ -45,7 +85,12 @@ def tab_builtin():
         st.warning("因子库为空，请先初始化数据。")
         return
 
-    # 按类别筛选
+    # 搜索和类别筛选同时约束选择器与详情卡片。
+    search_query = st.text_input(
+        "搜索因子",
+        placeholder="输入因子 ID、名称或类别",
+        key="builtin_factor_search",
+    ).strip().lower()
     categories = sorted(set(f.category for f in all_factors if f.category))
     selected_cats = st.multiselect(
         "按类别筛选",
@@ -57,6 +102,18 @@ def tab_builtin():
     filtered = all_factors
     if selected_cats:
         filtered = [f for f in all_factors if f.category in selected_cats]
+    if search_query:
+        filtered = [
+            factor for factor in filtered
+            if search_query in " ".join(
+                [
+                    factor.factor_id,
+                    factor.name_cn,
+                    factor.category or "",
+                    factor.description or "",
+                ]
+            ).lower()
+        ]
 
     st.caption(f"共 {len(filtered)} / {len(all_factors)} 个因子")
 
@@ -64,10 +121,39 @@ def tab_builtin():
         st.info("没有匹配的因子。")
         return
 
+    st.subheader("快速选择")
+    quick_factor = st.selectbox(
+        "选择一个内置因子作为当前研究对象",
+        options=filtered,
+        index=0,
+        format_func=lambda f: f"{f.factor_id} - {f.name_cn}",
+        key="builtin_quick_factor",
+    )
+    quick_cols = st.columns(2)
+    with quick_cols[0]:
+        if st.button("✅ 设为当前因子", key="set_quick_factor", type="primary", width="stretch"):
+            select_factor(st.session_state, quick_factor)
+            st.success(f"已选择 {quick_factor.name_cn}")
+            st.rerun()
+    with quick_cols[1]:
+        if st.button("🚀 设为当前因子并进入传统评估", key="set_quick_factor_and_go", width="stretch"):
+            select_factor(st.session_state, quick_factor)
+            st.switch_page("pages/03_传统评估.py")
+
+    st.markdown("---")
+
+    # 详情卡片只渲染首批结果，避免 805 个因子的 N+1 查询和超大页面。
+    card_limit = 12
+    displayed_factors = filtered[:card_limit]
+    if len(filtered) > card_limit:
+        st.caption(
+            f"当前展示前 {card_limit} 个结果；可通过搜索、类别筛选或上方选择器定位其余因子。"
+        )
+
     # 因子卡片网格：每行 3 列
     cols_per_row = 3
-    for i in range(0, len(filtered), cols_per_row):
-        row_factors = filtered[i:i + cols_per_row]
+    for i in range(0, len(displayed_factors), cols_per_row):
+        row_factors = displayed_factors[i:i + cols_per_row]
         cols = st.columns(cols_per_row)
         for j, factor in enumerate(row_factors):
             with cols[j]:
@@ -112,17 +198,16 @@ def tab_builtin():
                             if isinstance(turnover_val, (int, float)):
                                 st.metric("换手率", f"{turnover_val:.1%}")
 
-                    if st.button("选择", key=f"builtin_{factor.factor_id}", type="primary", width='stretch'):
-                        st.session_state["selected_factor_id"] = factor.factor_id
-                        st.session_state["selected_factor_name"] = factor.name_cn
-                        st.session_state["selected_factor_spec"] = factor
-                        st.switch_page("pages/03_传统评估.py")
+                    if st.button("选择", key=f"builtin_{factor.factor_id}", type="primary", width="stretch"):
+                        select_factor(st.session_state, factor)
+                        st.success(f"已选择 {factor.name_cn}，请点击上方按钮继续。")
+                        st.rerun()
 
 
 def tab_text():
     """标签页 2: 文本描述"""
     st.markdown("### 文本描述因子")
-    st.markdown("*用自然语言描述你的因子，AI 自动解析为结构化定义*")
+    st.markdown("*用自然语言描述因子，由确定性规则解析为结构化定义*")
 
     text_input = st.text_area(
         "输入因子描述",
@@ -131,7 +216,7 @@ def tab_text():
         key="text_factor_input",
     )
 
-    if st.button("🤖 AI 解析", type="primary", width='stretch'):
+    if st.button("解析为结构化定义", type="primary", width="stretch"):
         if not text_input.strip():
             st.warning("请输入因子描述文本。")
             return
@@ -170,8 +255,16 @@ def tab_text():
             st.markdown("**参数**")
             st.json(parsed.get("params", {}))
 
-            if st.button("✅ 确认并开始验真", type="primary", width='stretch'):
-                st.session_state["selected_factor_id"] = f"custom_{parsed.get('name_cn', 'unknown')}"
+            if st.button("✅ 确认并开始验真", type="primary", width="stretch"):
+                factor_id = _safe_factor_id("custom_text", parsed.get("name_cn", "factor"))
+                spec = _custom_spec(
+                    factor_id, parsed.get("name_cn", "自定义因子"), parsed["formula"],
+                    category=parsed.get("category", "其他"),
+                    direction=parsed.get("expected_direction", "higher"),
+                    params=parsed.get("params", {}), inputs=parsed.get("inputs", []),
+                    rationale=parsed.get("rationale_cn"),
+                )
+                select_factor(st.session_state, spec)
                 st.switch_page("pages/03_传统评估.py")
 
 
@@ -226,8 +319,10 @@ def tab_formula():
                 with c3:
                     st.metric("使用函数", ", ".join(result.used_functions) if result.used_functions else "无")
 
-                if st.button("✅ 确认并开始验真", key="formula_confirm", type="primary", width='stretch'):
-                    st.session_state["selected_factor_id"] = "custom_formula"
+                if st.button("✅ 确认并开始验真", key="formula_confirm", type="primary", width="stretch"):
+                    factor_id = _safe_factor_id("custom_formula", formula[:40])
+                    spec = _custom_spec(factor_id, "自定义公式因子", formula.strip())
+                    select_factor(st.session_state, spec)
                     st.switch_page("pages/03_传统评估.py")
         except Exception as e:
             st.error(f"解析异常: {e}")
@@ -249,7 +344,7 @@ def tab_upload():
             return
 
         st.markdown("#### 文件预览")
-        st.dataframe(df.head(10), width='stretch')
+        st.dataframe(df.head(10), width="stretch")
         st.caption(f"共 {len(df)} 行，{len(df.columns)} 列")
 
         # 校验
@@ -272,29 +367,26 @@ def tab_upload():
 
             factor_cols = [c for c in df.columns if c not in required_cols]
             if factor_cols:
+                factor_col = st.selectbox("选择因子值列", factor_cols, key="upload_factor_col")
                 st.markdown("**因子值列**")
                 for col in factor_cols:
                     st.caption(f"`{col}` — {df[col].dtype}")
 
-            if st.button("✅ 确认并开始验真", key="upload_confirm", type="primary", width='stretch'):
-                st.session_state["selected_factor_id"] = "custom_upload"
+            if st.button("✅ 确认并开始验真", key="upload_confirm", type="primary", width="stretch"):
+                if not factor_cols:
+                    st.error("没有可用的因子值列。")
+                    return
+                factor_values = df[["trade_date", "ts_code", factor_col]].rename(columns={factor_col: "factor_value"})
+                factor_values["trade_date"] = pd.to_datetime(factor_values["trade_date"], errors="coerce")
+                factor_values["factor_value"] = pd.to_numeric(factor_values["factor_value"], errors="coerce")
+                factor_id = _safe_factor_id("custom_upload", factor_col)
+                spec = FactorSpec(
+                    factor_id=factor_id, name=factor_id, name_cn=f"上传因子：{factor_col}",
+                    description="用户上传的标准化因子值", base="uploaded",
+                    inputs=[factor_col], min_window=1, source="custom",
+                )
+                select_factor(st.session_state, spec, factor_df=factor_values)
                 st.switch_page("pages/03_传统评估.py")
-
-
-def tab_script():
-    """标签页 5: Python 脚本"""
-    st.markdown("### 🐍 Python 脚本导入")
-    st.markdown("*即将支持*")
-
-    st.info(
-        "🐍 Python 脚本导入 — 即将支持\n\n"
-        "支持上传自定义因子计算脚本，沙箱安全执行。\n\n"
-        "功能规划：\n"
-        "- 上传 `.py` 脚本文件\n"
-        "- 沙箱隔离执行，限制网络/文件系统访问\n"
-        "- 自动检测脚本中的未来函数风险\n"
-        "- 支持自定义参数配置"
-    )
 
 
 def main():
@@ -304,12 +396,11 @@ def main():
     st.title("📥 因子输入")
     st.markdown("*选择以下任一方式引入因子*")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📦 内置因子",
         "📝 文本描述",
         "🔢 受限公式",
         "📁 因子值上传",
-        "🐍 Python 脚本",
     ])
 
     with tab1:
@@ -320,8 +411,6 @@ def main():
         tab_formula()
     with tab4:
         tab_upload()
-    with tab5:
-        tab_script()
 
 
 if __name__ == "__main__":

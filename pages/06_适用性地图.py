@@ -9,6 +9,7 @@ from config import PLOTLY_TEMPLATE, CHART_HEIGHT
 from engine.suitability import compute_suitability_map
 from engine.factor_computer import load_aligned_data
 from engine.run_recorder import save_run
+from engine.session_context import build_cache_context, contextual_cache_key, set_audit_result
 from ui.color_utils import get_heatmap_colorscale, COLOR_PASS, COLOR_WARN, COLOR_FAIL, COLOR_NEUTRAL, COLOR_UNTESTED
 from ui.chart_utils import create_heatmap
 
@@ -93,7 +94,7 @@ def render_suitability_heatmap(result):
         margin=dict(l=80, r=40, t=50, b=40),
     )
 
-    st.plotly_chart(fig, width='stretch')
+    st.plotly_chart(fig, width="stretch")
 
     # 图例说明
     st.markdown("#### 图例说明")
@@ -129,7 +130,7 @@ def render_sample_table(result):
         rows.append([dim1_vals[i]] + [str(cell["sample_count"]) for cell in row])
 
     df = pd.DataFrame(rows, columns=header)
-    st.dataframe(df.set_index(header[0]), width='stretch')
+    st.dataframe(df.set_index(header[0]), width="stretch")
 
 
 def render_evidence_table(result):
@@ -161,6 +162,53 @@ def render_evidence_table(result):
 
     df = pd.DataFrame(rows, columns=header)
     st.markdown(df.set_index(header[0]).to_html(escape=False), unsafe_allow_html=True)
+
+
+def build_demo_suitability_result(dim1_key: str, dim2_key: str):
+    """在无实时数据时构造演示版适用性地图。"""
+    dim_label_map = {
+        "market_cap": ("小盘", "中盘", "大盘"),
+        "volatility": ("低波动", "中波动", "高波动"),
+        "style": ("价值", "均衡", "成长"),
+        "liquidity": ("低流动性", "中流动性", "高流动性"),
+        "time": ("早期", "中期", "近期"),
+    }
+    dim_name_map = {
+        "market_cap": "市值",
+        "volatility": "波动率",
+        "style": "成长价值",
+        "liquidity": "流动性",
+        "time": "时间",
+    }
+
+    dim1_vals = list(dim_label_map.get(dim1_key, ("A", "B", "C")))
+    dim2_vals = list(dim_label_map.get(dim2_key, ("X", "Y", "Z")))
+    base_matrix = [
+        [0.025, 0.012, -0.004],
+        [0.018, 0.009, -0.002],
+        [0.011, 0.004, -0.008],
+    ]
+
+    matrix = []
+    for i, row in enumerate(base_matrix):
+        matrix_row = []
+        for j, rank_ic in enumerate(row):
+            matrix_row.append({
+                "rank_ic": rank_ic,
+                "sample_count": 400 - i * 60 - j * 30,
+                "direction_flipped": rank_ic < 0,
+                "evidence_level": "good" if abs(rank_ic) >= 0.015 else ("mid" if abs(rank_ic) >= 0.005 else "weak"),
+            })
+        matrix.append(matrix_row)
+
+    return {
+        "matrix": matrix,
+        "dim1_values": dim1_vals,
+        "dim2_values": dim2_vals,
+        "dim1_name": dim_name_map.get(dim1_key, dim1_key),
+        "dim2_name": dim_name_map.get(dim2_key, dim2_key),
+        "overall_assessment": "当前结果为演示级适用性摘要：因子在低波动/小盘等环境中表现更强，在高波动或大盘区间边际走弱，适合用作路演说明材料。",
+    }
 
 
 def main():
@@ -210,7 +258,14 @@ def main():
     # ============================================================
     # 缓存检查：避免重复计算
     # ============================================================
-    cache_key = f"suitability_{factor_id}_{dim1_key}_{dim2_key}"
+    forward_period = int(st.session_state.get("forward_period", 5))
+    cache_context = build_cache_context(
+        st.session_state,
+        forward_period=forward_period,
+        dim1=dim1_key,
+        dim2=dim2_key,
+    )
+    cache_key = contextual_cache_key("suitability", cache_context)
     cached = st.session_state.get(cache_key)
 
     if cached is not None:
@@ -219,46 +274,49 @@ def main():
     else:
         # 加载数据
         with st.spinner("正在加载和计算因子数据..."):
-            aligned_df = load_aligned_data(st.session_state)
+            aligned_df = load_aligned_data(st.session_state, forward_period)
 
         if aligned_df is None:
-            st.warning(f"⚠️ 因子数据加载失败（factor_id: {factor_id}），请检查数据是否完整。")
-            st.info("""
-            **使用步骤：**
-            1. 前往 **因子输入** 页面选择或上传因子
-            2. 完成因子评估，生成对齐数据
-            3. 返回本页面查看适用性地图
-            """)
-            return
-
-        # 计算适用性
-        with st.spinner("正在计算适用性地图..."):
-            try:
-                result = compute_suitability_map(
-                    aligned_df,
-                    dim1=dim1_key,
-                    dim2=dim2_key,
-                )
-                st.session_state["suitability_result"] = result
-            except Exception as e:
-                st.error(f"计算失败: {e}")
-                return
-
-        # 缓存计算结果
-        st.session_state[cache_key] = result
-
-        # 保存运行记录到工作台
-        factor_name = st.session_state.get("selected_factor_name", factor_id)
-        assessment = result.get("overall_assessment", "")
-        # 从评估文本推断裁决
-        if "有效" in assessment or "显著" in assessment:
-            suit_verdict = "supported"
-        elif "弱" in assessment or "不稳定" in assessment:
-            suit_verdict = "fragile"
+            result = build_demo_suitability_result(dim1_key, dim2_key)
+            result["source"] = "demo"
+            st.warning("⚠️ 未找到实时对齐数据，已切换为演示版适用性摘要。")
+            st.session_state[cache_key] = result
+            factor_name = st.session_state.get("selected_factor_name", factor_id)
+            save_run(factor_name, factor_id, "insufficient",
+                     "适用性地图使用演示级摘要", st.session_state)
         else:
-            suit_verdict = "conditional"
-        save_run(factor_name, factor_id, suit_verdict,
-                 assessment[:120] if assessment else "适用性分析完成", st.session_state)
+            # 计算适用性
+            with st.spinner("正在计算适用性地图..."):
+                try:
+                    result = compute_suitability_map(
+                        aligned_df,
+                        dim1=dim1_key,
+                        dim2=dim2_key,
+                    )
+                    result["source"] = "computed"
+                except Exception as e:
+                    st.error(f"计算失败: {e}")
+                    return
+
+            # 缓存计算结果
+            st.session_state[cache_key] = result
+
+            # 保存运行记录到工作台
+            factor_name = st.session_state.get("selected_factor_name", factor_id)
+            assessment = result.get("overall_assessment", "")
+            # 从评估文本推断裁决
+            if "有效" in assessment or "显著" in assessment:
+                suit_verdict = "supported"
+            elif "弱" in assessment or "不稳定" in assessment:
+                suit_verdict = "fragile"
+            else:
+                suit_verdict = "conditional"
+            save_run(factor_name, factor_id, suit_verdict,
+                     assessment[:120] if assessment else "适用性分析完成", st.session_state)
+
+    st.session_state["suitability_result"] = result
+    st.session_state["suitability_results"] = result
+    set_audit_result(st.session_state, "suitability", result)
 
     # 渲染热力图
     render_suitability_heatmap(result)

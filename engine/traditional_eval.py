@@ -24,8 +24,19 @@ def compute_daily_rank_ic(aligned_df: pd.DataFrame,
             "coverage": dict[date, float],  # 每日覆盖率
         }
     """
-    df = aligned_df.copy()
-    df['trade_date'] = pd.to_datetime(df['trade_date'])
+    source_df = aligned_df.copy()
+    source_df['trade_date'] = pd.to_datetime(source_df['trade_date'])
+    source_df.loc[np.isinf(source_df[factor_col]), factor_col] = np.nan
+    source_df.loc[np.isinf(source_df[return_col]), return_col] = np.nan
+
+    # 覆盖率相对存在有效收益标签的应有股票池计算，必须在删除缺失因子值前完成。
+    coverage_base = source_df[source_df[return_col].notna()]
+    if coverage_base.empty:
+        daily_coverage = pd.Series(dtype=float)
+    else:
+        daily_coverage = coverage_base.groupby('trade_date')[factor_col].apply(lambda s: s.notna().mean())
+
+    df = source_df.copy()
     df = df.dropna(subset=[factor_col, return_col])
     df = df[~np.isinf(df[factor_col]) & ~np.isinf(df[return_col])]
 
@@ -37,6 +48,7 @@ def compute_daily_rank_ic(aligned_df: pd.DataFrame,
 
     for date in dates:
         day = df[df['trade_date'] == date]
+        coverage_dict[date] = float(daily_coverage.get(date, 0.0))
         if len(day) < 10:
             continue
 
@@ -52,10 +64,6 @@ def compute_daily_rank_ic(aligned_df: pd.DataFrame,
             factor_sign = np.sign(day[factor_col] - day[factor_col].median())
             return_sign = np.sign(day[return_col] - day[return_col].median())
             direction_dict[date] = (factor_sign == return_sign).mean()
-
-        total_stocks = len(day)
-        valid_stocks = day[factor_col].notna().sum()
-        coverage_dict[date] = valid_stocks / total_stocks if total_stocks > 0 else 0
 
     return {
         "dates": [str(d) for d in dates],
@@ -88,8 +96,18 @@ def evaluate_factor(aligned_df: pd.DataFrame,
         ic_p_value, direction_consistency, group_returns, cumulative_returns,
         turnover_top, turnover_bottom, coverage, rolling_ic, sample_count, date_range
     """
-    df = aligned_df.copy()
-    df['trade_date'] = pd.to_datetime(df['trade_date'])
+    source_df = aligned_df.copy()
+    source_df['trade_date'] = pd.to_datetime(source_df['trade_date'])
+    source_df.loc[np.isinf(source_df[factor_col]), factor_col] = np.nan
+    source_df.loc[np.isinf(source_df[return_col]), return_col] = np.nan
+    coverage_base = source_df[source_df[return_col].notna()]
+    if coverage_base.empty:
+        coverage = 0.0
+    else:
+        daily_coverage = coverage_base.groupby('trade_date')[factor_col].apply(lambda s: s.notna().mean())
+        coverage = float(daily_coverage.mean()) if not daily_coverage.empty else 0.0
+
+    df = source_df.copy()
     df = df.dropna(subset=[factor_col, return_col])
     df = df[~np.isinf(df[factor_col]) & ~np.isinf(df[return_col])]
 
@@ -105,12 +123,10 @@ def evaluate_factor(aligned_df: pd.DataFrame,
         ic_list = [v for v in daily_rank_ic["ic"].values()]
         rank_ic_list = [v for v in daily_rank_ic["rank_ic"].values()]
         direction_list = [v for v in daily_rank_ic["direction"].values()]
-        coverage_list = [v for v in daily_rank_ic["coverage"].values()]
     else:
         ic_list = []
         rank_ic_list = []
         direction_list = []
-        coverage_list = []
 
     group_returns_dict = {0: [], 1: [], 2: [], 3: [], 4: []}
     top_turnover_list = []
@@ -135,10 +151,6 @@ def evaluate_factor(aligned_df: pd.DataFrame,
                 factor_sign = np.sign(day[factor_col] - day[factor_col].median())
                 return_sign = np.sign(day[return_col] - day[return_col].median())
                 direction_list.append((factor_sign == return_sign).mean())
-
-            total_stocks = len(day)
-            valid_stocks = day[factor_col].notna().sum()
-            coverage_list.append(valid_stocks / total_stocks if total_stocks > 0 else 0)
 
         # 分组收益（始终需要计算，无法预计算复用）
         try:
@@ -195,7 +207,7 @@ def evaluate_factor(aligned_df: pd.DataFrame,
     turnover_bottom = float(np.mean(bottom_turnover_list)) if bottom_turnover_list else 0.0
 
     # 覆盖率
-    coverage = float(np.mean(coverage_list)) if coverage_list else 0.0
+    # `coverage` 已在过滤缺失值之前按完整应有股票池计算。
 
     # 滚动 RankIC（63 日滚动窗口，min_periods=30）
     rolling_ic_df = _compute_rolling_rank_ic(df, factor_col, return_col, dates)

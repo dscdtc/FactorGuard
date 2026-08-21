@@ -15,7 +15,7 @@ def load_demo_master_method() -> MasterMethodSpec:
                 master_perspective="巴菲特",
                 proxy_factors=["ROE稳定性因子"],
                 proxy_grade="B",
-                proxy_limitations="本地数据含净利润/净资产，可计算ROE。但需10年连续数据，早期数据缺失。",
+                proxy_limitations="可用净利润TTM/净资产构造资本效率代理，但当前快照仅一年且缺少财务公告日期，不能等同于10年平均ROE。",
                 measurable=True
             ),
             Principle(
@@ -24,7 +24,7 @@ def load_demo_master_method() -> MasterMethodSpec:
                 master_perspective="巴菲特",
                 proxy_factors=["经营现金流/净利润比"],
                 proxy_grade="C",
-                proxy_limitations="需现金流量表数据，本地数据缺失，需akshare补充。",
+                proxy_limitations="本地只有现金流TTM汇总值，缺少自由现金流口径及财务公告日期，无法验证5年累计自由现金流。",
                 measurable=True
             ),
             Principle(
@@ -51,7 +51,7 @@ def load_demo_master_method() -> MasterMethodSpec:
                 master_perspective="李录",
                 proxy_factors=["现金流质量因子"],
                 proxy_grade="C",
-                proxy_limitations="需现金流数据，本地数据缺失。",
+                proxy_limitations="本地有现金流TTM，但缺少经营现金流口径、公告日期及足够历史，当前不可鉴证。",
                 measurable=False
             ),
             Principle(

@@ -271,3 +271,19 @@ def detect_formula_similarity(spec1, spec2) -> dict | None:
         return _formula_similarity(spec1, spec2)
     except Exception:
         return None
+
+
+def find_formula_duplicates(spec, candidates, threshold: float = 0.8) -> list[dict]:
+    """查找公式相似度超过阈值的候选因子。"""
+    duplicates = []
+    for other in candidates:
+        if other.factor_id == spec.factor_id:
+            continue
+        similarity = detect_formula_similarity(spec, other)
+        if similarity and similarity.get("score", 0.0) > threshold:
+            duplicates.append({
+                "factor_id": other.factor_id,
+                "score": similarity["score"],
+                "level": similarity.get("level"),
+            })
+    return sorted(duplicates, key=lambda item: item["score"], reverse=True)

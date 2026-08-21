@@ -1,7 +1,15 @@
 """
 FactorGuard 因子验真台 — Streamlit 主入口
 """
+import json
+
 import streamlit as st
+
+from config import BASIC_PARQUET, DATA_LOCAL, OHLCV_PARQUET, SNAPSHOT_MANIFEST
+from engine.factor_loader import get_factor_by_id
+from engine.session_context import select_factor
+from models.factor_spec import FactorSpec
+from ui.color_utils import get_verdict_color
 
 st.set_page_config(
     page_title="FactorGuard 因子验真台",
@@ -10,11 +18,150 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+def snapshot_range_label() -> str:
+    """Read the user-facing sample range from the frozen snapshot manifest."""
+    try:
+        manifest = json.loads(SNAPSHOT_MANIFEST.read_text(encoding="utf-8"))
+        start = manifest.get("date_start")
+        end = manifest.get("date_end")
+        if start and end:
+            return f"比赛快照（{start} 至 {end}）"
+    except (OSError, ValueError, TypeError):
+        pass
+    return "当前 Parquet 快照"
+
+
+def load_snapshot_manifest() -> dict:
+    """Load the frozen snapshot metadata used by the homepage."""
+    try:
+        return json.loads(SNAPSHOT_MANIFEST.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def render_data_snapshot() -> None:
+    """Render the portable competition snapshot status."""
+    manifest = load_snapshot_manifest()
+    snapshot_ready = OHLCV_PARQUET.exists() and BASIC_PARQUET.exists()
+    source_ready = DATA_LOCAL.exists()
+    start = manifest.get("date_start")
+    end = manifest.get("date_end")
+    date_range = f"{start} 至 {end}" if start and end else "未记录"
+    stocks = manifest.get("stocks")
+    rows = manifest.get("rows")
+
+    st.subheader("数据快照")
+    cols = st.columns(4)
+    with cols[0]:
+        st.metric("行情快照", "已就绪" if snapshot_ready else "缺失")
+    with cols[1]:
+        st.metric("样本区间", date_range)
+    with cols[2]:
+        st.metric("覆盖股票", f"{stocks:,} 只" if isinstance(stocks, int) else "未记录")
+    with cols[3]:
+        st.metric("样本行数", f"{rows:,}" if isinstance(rows, int) else "未记录")
+
+    if snapshot_ready and not source_ready:
+        st.caption("正式快照可独立运行；只有重建快照时才需要原始 CSV 数据源。")
+    elif not snapshot_ready and source_ready:
+        st.warning("已发现原始数据，但正式 Parquet 快照缺失。请先显式运行快照构建脚本。")
+    elif not snapshot_ready:
+        st.warning("正式快照和原始数据源均不可用，目前只能查看历史预计算摘要。")
+
+
+def render_recent_runs() -> None:
+    """Render the latest deterministic audit outcomes from this session."""
+    st.subheader("最近运行")
+    runs = st.session_state.get("recent_runs", [])
+    if not runs:
+        st.info("暂无运行记录。新建鉴证后，正式结论会显示在这里。")
+        return
+
+    verdict_labels = {
+        "invalid": "无效",
+        "insufficient": "证据不足",
+        "fragile": "脆弱",
+        "conditional": "条件有效",
+        "supported": "当前支持",
+    }
+    for run in runs:
+        verdict = run.get("verdict", "unknown")
+        cols = st.columns([3, 2, 2, 3])
+        with cols[0]:
+            st.markdown(f"**{run.get('name', '未知因子')}**")
+        with cols[1]:
+            st.caption(run.get("run_time", "未知时间"))
+        with cols[2]:
+            st.markdown(
+                f'<span style="color:{get_verdict_color(verdict)};font-weight:700">'
+                f'{verdict_labels.get(verdict, verdict)}</span>',
+                unsafe_allow_html=True,
+            )
+        with cols[3]:
+            st.caption(run.get("risk_summary", ""))
+        st.divider()
+
+
+def render_demo_entries() -> None:
+    """Render the four competition demo entry points."""
+    st.subheader("Demo 快速体验")
+    demos = [
+        {
+            "title": "未来函数因子",
+            "description": "验证未来数据泄漏必须导致无效结论。",
+            "factor_id": "demo_future_leak",
+            "target": "pages/09_鉴证运行.py",
+        },
+        {
+            "title": "重复因子",
+            "description": "检查公式、暴露和收益序列的重复性。",
+            "factor_id": "demo_duplicate",
+            "target": "pages/05_重复性检测.py",
+        },
+        {
+            "title": "小微盘暴露",
+            "description": "检查收益是否依赖小市值股票暴露。",
+            "factor_id": "R072",
+            "target": "pages/04_压力测试.py",
+        },
+        {
+            "title": "大师方法",
+            "description": "验证公开方法的可计算代理与时点边界。",
+            "factor_id": "demo_buffett",
+            "target": "pages/07_大师方法拆解.py",
+        },
+    ]
+
+    cols = st.columns(4)
+    for index, demo in enumerate(demos):
+        with cols[index]:
+            with st.container(border=True):
+                st.markdown(f"**{demo['title']}**")
+                st.caption(demo["description"])
+                if st.button("运行", key=f"home_demo_{index}", width="stretch"):
+                    spec = get_factor_by_id(demo["factor_id"])
+                    if spec is None:
+                        spec = FactorSpec(
+                            factor_id=demo["factor_id"],
+                            name=demo["factor_id"],
+                            name_cn=demo["title"],
+                            description=demo["description"],
+                            base="return",
+                            params={"window": 20},
+                            source="demo",
+                        )
+                    select_factor(st.session_state, spec, is_demo=True)
+                    st.switch_page(demo["target"])
+
+
+SNAPSHOT_RANGE_LABEL = snapshot_range_label()
+
 # ── 全局状态初始化 ──
 if "market" not in st.session_state:
     st.session_state.market = "A股"
 if "time_range" not in st.session_state:
-    st.session_state.time_range = "全量"
+    st.session_state.time_range = SNAPSHOT_RANGE_LABEL
 if "selected_factor" not in st.session_state:
     st.session_state.selected_factor = None
 if "selected_factor_id" not in st.session_state:
@@ -30,10 +177,10 @@ if "recent_runs" not in st.session_state:
 if not st.session_state.factors_loaded:
     with st.spinner("正在加载因子库..."):
         try:
-            from engine.factor_loader import init_db, load_all_factors
-            from config import FACTORS_DIR
-            init_db()
-            st.session_state.all_factors = load_all_factors(FACTORS_DIR)
+            from engine.factor_loader import get_all_factors
+
+            factors = get_all_factors()
+            st.session_state.all_factors = factors
             st.session_state.factors_loaded = True
         except Exception as e:
             st.error(f"因子库加载失败: {e}")
@@ -67,16 +214,10 @@ with st.sidebar:
     else:
         st.session_state.market = selected_market
 
-    # 时间范围
-    st.markdown("### 时间范围")
-    time_options = ["全量 (2019-2026)", "近3年", "近5年", "自定义..."]
-    selected_time = st.selectbox(
-        "选择时间范围",
-        time_options,
-        index=0,
-        label_visibility="collapsed",
-    )
-    st.session_state.time_range = selected_time
+    # 全局仅展示正式快照范围；细分筛选在传统评估页执行。
+    st.markdown("### 数据范围")
+    st.caption(SNAPSHOT_RANGE_LABEL)
+    st.session_state.time_range = SNAPSHOT_RANGE_LABEL
 
     st.divider()
 
@@ -104,25 +245,43 @@ with st.sidebar:
     st.markdown("- 📝 文本描述")
     st.markdown("- 🔢 受限公式")
     st.markdown("- 📤 上传因子值")
-    st.markdown("- 🐍 Python脚本 *(即将支持)*")
+    st.caption("安全边界：不执行用户上传的 Python 脚本")
 
     st.divider()
     st.markdown("*研究质量基础设施*")
     st.markdown("*不输出交易信号*")
 
-# ── 主内容区 ──
-st.title("🔬 FactorGuard 因子验真台")
-st.markdown("*研究质量基础设施 — 不输出交易信号*")
+def render_home() -> None:
+    """Render the single homepage replacing the former workbench page."""
+    st.title("🔬 FactorGuard 因子验真台")
+    st.markdown("*研究质量基础设施 — 不输出交易信号*")
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric("内置因子", len(st.session_state.get("all_factors", [])) if st.session_state.get("all_factors") else 0)
-with col2:
-    st.metric("市场", st.session_state.market)
-with col3:
-    st.metric("时间范围", st.session_state.time_range)
+    if st.button("新建鉴证", type="primary", width="stretch"):
+        st.switch_page("pages/02_因子输入.py")
 
-st.info(
-    "👈 请使用左侧导航栏进入各功能页面，或点击下方按钮开始鉴证。\n\n"
-    "**页面导航：** 工作台 → 因子输入 → 传统评估 → 压力测试 → 重复检测 → 适用性地图 → 大师方法 → 报告凭证"
+    st.divider()
+    render_data_snapshot()
+    st.divider()
+    render_recent_runs()
+    st.divider()
+    render_demo_entries()
+
+
+navigation = st.navigation(
+    {
+        "研究工作流": [
+            st.Page(render_home, title="首页", icon="🏠", default=True),
+            st.Page("pages/02_因子输入.py", title="因子输入", icon="📥"),
+            st.Page("pages/03_传统评估.py", title="传统评估", icon="🔍"),
+            st.Page("pages/04_压力测试.py", title="压力测试", icon="💪"),
+            st.Page("pages/05_重复性检测.py", title="重复性检测", icon="🔗"),
+            st.Page("pages/06_适用性地图.py", title="适用性地图", icon="📊"),
+            st.Page("pages/07_大师方法拆解.py", title="大师方法拆解", icon="👨‍🏫"),
+            st.Page("pages/08_报告与凭证.py", title="报告与凭证", icon="🧾"),
+            st.Page("pages/09_鉴证运行.py", title="鉴证运行", icon="🧪"),
+        ]
+    },
+    position="sidebar",
+    expanded=True,
 )
+navigation.run()

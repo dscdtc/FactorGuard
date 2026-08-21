@@ -4,6 +4,8 @@
 >
 > 回测告诉您因子过去表现如何，FactorGuard 告诉您这个结论是否经得起质疑。
 
+> **当前版本说明：** 当前工作区和比赛提交包包含 2024-09-27 至 2025-09-26 的 A 股比赛快照，可执行真实评估与压力测试；GitHub 源码包为避免大文件进入 Git 历史，不捆绑 Parquet 和 DuckDB，正式快照通过 Release 附件分发或由用户显式重建。内置因子也可离线展示历史预计算摘要。预计算、演示和未测试结果会分别标记，不等同于完整实时鉴证。当前修复状态见 [PROJECT_STATUS](DOC/PROJECT_STATUS.md)。
+
 🔬 [在线运行](#快速开始) | 📄 [PRD 文档](DOC/FactorGuard_PRD_V1.1.md) | 🏗️ [技术设计](DOC/FACTORGUARD_TECHNICAL_DESIGN.md)
 
 ---
@@ -30,17 +32,19 @@ FactorGuard 是一款面向个人量化研究者的**因子验真工具**。它�
 
 | 页面 | 功能 |
 |---|---|
-| 🏠 **工作台** | 新建鉴证、最近运行记录、Demo 入口 |
+| 🏠 **首页** | 数据快照、新建鉴证、最近运行记录、四个 Demo 入口 |
 | 📥 **因子输入** | 因子导入：内置因子库 / 文本描述 / 受限公式 / 上传因子值 |
 | 🔍 **传统评估** | 完整 Tear Sheet：IC / RankIC / ICIR / 分组收益 / 换手率 / IC 衰减 / 滚动统计 |
 | 💪 **压力测试** | 对抗式检验：执行延迟 / 微盘暴露 / 中性化 / 极端样本 / Bootstrap 置信区间 |
 | 🔗 **重复性检测** | 三重检测：公式结构 / 横截面暴露 / 收益序列相似度 |
 | 📊 **适用性地图** | 多维度适用性热力图（市值 × 波动率 × 时间段 × 股票池） |
 | 👨‍🏫 **大师方法拆解** | 拆解公开投资方法论为结构化原则与可鉴证的代理因子 |
-| 🧾 **报告与凭证** | 总览报告、证据维度汇总、确定性哈希复现凭证 |
+| 🧾 **报告与凭证** | 正式报告、确定性哈希复现凭证，以及独立的可校验 AI 辅助解读 Tab |
 | 🧪 **鉴证运行** | 端到端鉴证流程编排与运行记录 |
 
-**内置因子库：** 随附 3 个因子 Skill 仓库（方向性 Alpha / 风险模式 Alpha / 量价统计 Alpha），共 200+ 个标准化因子，均附带真实数据验证指标。
+大师方法页包含一个可真实计算的资本效率代理（净利润TTM/净资产）。由于本地数据没有财务公告日期，系统会明确将时间正确性标为未测试，最终不把代理结果包装成已经验证的“大师策略”。
+
+**内置因子库：** 随附 3 个因子 Skill 仓库（方向性 Alpha / 风险模式 Alpha / 量价统计 Alpha），共 800 个标准化因子；另有 5 个异常 Demo 和 1 个大师代理，总计 806 个可选条目。内置标准因子附带历史真实数据验证指标。
 
 ---
 
@@ -54,10 +58,10 @@ FactorGuard 是一款面向个人量化研究者的**因子验真工具**。它�
 | 数据存储 | **Parquet 列式快照 + DuckDB** | 列式存储 + 向量化查询，较 SQLite 提速 10–100 倍 |
 | 因子解析 | Lark ≥ 1.1 | 受限公式语言解析器，生成 AST（避免 `eval` 风险） |
 | 数据模型 | Pydantic ≥ 2.5 | FactorSpec / Evidence / MasterMethod 等结构化模型 |
-| 数据源 | 本地数据集 + akshare / baostock | 本地日线数据为主，免费开源数据源补充 |
+| 数据源 | 冻结 Parquet 快照 + 本地 CSV | 页面使用冻结快照；原始 CSV 仅用于显式重建 |
 
 ```
-本地数据 (H:\data\stock-trading-data-pro)
+本地数据 (E:\Quantclass\stock-trading-data-pro)
         │
         ▼
 ┌─────────────────────┐     ┌──────────────────────────┐
@@ -67,7 +71,7 @@ FactorGuard 是一款面向个人量化研究者的**因子验真工具**。它�
                                        │
 ┌─────────────────────┐     ┌──────────▼───────────────┐
 │  Factors/ 因子库     │────▶│  factor_computer.py      │  因子值计算
-│  (SKILL.md + index) │     │  factor_cache/*.parquet  │  预计算缓存
+│  (SKILL.md + index) │     │  session context cache   │  会话缓存
 └─────────────────────┘     └──────────┬───────────────┘
                                        │
             ┌──────────────────────────┼──────────────────────────┐
@@ -90,13 +94,12 @@ FactorGuard 是一款面向个人量化研究者的**因子验真工具**。它�
 
 ```
 FactorGuard/
-├── app.py                  # Streamlit 主入口（多页面路由 + 全局状态）
+├── app.py                  # Streamlit 首页（数据快照 + 新建鉴证 + 最近运行 + Demo）
 ├── config.py               # 全局配置（路径、参数、颜色映射）
 ├── requirements.txt        # Python 依赖清单
 ├── setup.bat               # Windows 一键环境初始化脚本
 │
 ├── pages/                  # Streamlit 多页面模块
-│   ├── 01_工作台.py
 │   ├── 02_因子输入.py
 │   ├── 03_传统评估.py
 │   ├── 04_压力测试.py
@@ -128,7 +131,7 @@ FactorGuard/
 │
 ├── data/                   # 数据存储（运行时生成）
 │   ├── snapshot/           # 冻结数据快照（Parquet）
-│   ├── factor_cache/       # 预计算因子值缓存
+│   ├── factor_cache/       # 预留的磁盘因子缓存（当前未启用）
 │   └── factor_master.duckdb# DuckDB 元数据库
 │
 ├── Factors/                # 内置因子库（只读引用，3 个 Skill 仓库）
@@ -143,7 +146,7 @@ FactorGuard/
 
 - **Python ≥ 3.11**
 - **Windows 10/11**（项目在 Windows 环境开发验证；Linux/macOS 亦可运行，仅需调整激活脚本）
-- 本地数据集（可选）：`H:\data\stock-trading-data-pro` — A 股全量股票日线行情（含 OHLCV、市值、PE/PB、行业分类）。缺失时项目使用 `data/snapshot/` 内已生成的 Parquet 快照。
+- 本地数据集（仅重建快照时需要）：默认 `E:\Quantclass\stock-trading-data-pro`，也可通过环境变量 `FACTORGUARD_DATA_LOCAL` 指定。页面只读取随项目提供的 `data/snapshot/`，换电脑运行不需要复制原始 CSV。
 
 ### 5.2 方式一：Windows 一键初始化
 
@@ -166,6 +169,21 @@ venv\Scripts\activate        # Windows
 pip install -r requirements.txt
 ```
 
+需要重建比赛快照时显式执行：
+
+```bash
+py scripts/build_snapshots.py --date-start 2024-09-27 --date-end 2025-09-26
+```
+
+原始数据不在默认位置时：
+
+```powershell
+$env:FACTORGUARD_DATA_LOCAL = "D:\your-data\stock-trading-data-pro"
+py scripts/build_snapshots.py --date-start 2024-09-27 --date-end 2025-09-26
+```
+
+构建过程逐 CSV 流式写入 Parquet；页面不会自动触发该任务。完整源目录首次构建约需十余分钟，完成后读取快照为秒级。
+
 <details>
 <summary>依赖清单（点击展开）</summary>
 
@@ -179,7 +197,6 @@ pip install -r requirements.txt
 | pydantic ≥ 2.5 | 数据模型 |
 | pyarrow ≥ 14.0 | Parquet 读写 |
 | duckdb ≥ 1.0 | 列式查询引擎 |
-| akshare ≥ 1.14 / baostock ≥ 0.8.8 | 补充数据源 |
 | openpyxl ≥ 3.1 | Excel 导出 |
 
 </details>
@@ -197,8 +214,8 @@ streamlit run app.py
 启动后浏览器自动打开 **http://localhost:8501**，即可通过左侧导航栏进入各功能页面。
 
 > 💡 **使用提示：**
-> - 首次进入各页面时，请在「因子输入」页选择因子并预计算，后续页面即可直接使用缓存结果；
-> - 已计算的评估结果会按 `因子 × 参数` 缓存在会话中，重复访问页面直接显示「📦 使用缓存数据」，无需重新计算；
+> - 首次使用时先在「因子输入」页选择因子；有正式行情快照时实时计算，没有快照时仅展示内置因子的历史预计算摘要；
+> - 已计算结果按因子规格、上传数据、前瞻周期、时间范围、Bootstrap 参数和数据快照身份缓存在会话中；上下文一致时重复访问会直接使用缓存；
 > - Streamlit 支持代码热重载，修改代码后页面自动刷新。
 
 ### 5.5 指定端口启动（可选）
@@ -207,51 +224,75 @@ streamlit run app.py
 streamlit run app.py --server.port 8503
 ```
 
+同一局域网设备访问时，可显式监听全部接口：
+
+```bash
+streamlit run app.py --server.port 8501 --server.address 0.0.0.0
+```
+
+### 5.6 AI 辅助解读模型配置（可选）
+
+完成正式鉴证后，在“报告与凭证 → AI 辅助解读”中选择供应商和模型 ID。当前内置 OpenAI、DeepSeek、通义千问 / DashScope、智谱、Moonshot / Kimi、硅基流动及自定义 OpenAI-compatible 七种选项。
+
+API Key 不在页面填写，只从启动 Streamlit 的同一终端环境读取：
+
+```powershell
+$env:FACTORGUARD_LLM_PROVIDER = "deepseek"
+$env:FACTORGUARD_LLM_API_KEY = "<your-api-key>"
+py -m streamlit run app.py --server.port 8501
+```
+
+页面可编辑模型 ID。需要固定默认值、使用企业代理或自定义兼容服务时，可额外设置：
+
+```powershell
+$env:FACTORGUARD_LLM_MODEL = "deepseek-chat"
+$env:FACTORGUARD_LLM_BASE_URL = "https://api.deepseek.com"
+$env:FACTORGUARD_LLM_TIMEOUT = "20"
+```
+
+自定义供应商必须提供兼容 Chat Completions 的 Base URL 和模型 ID。旧版仅设置 `FACTORGUARD_LLM_BASE_URL`、`FACTORGUARD_LLM_MODEL`、`FACTORGUARD_LLM_API_KEY` 的方式仍然有效。环境变量修改后需重启 Streamlit；未配置密钥或调用失败时自动显示 `rule_fallback`。
+
+密钥不会进入页面控件、Streamlit session state、模型请求正文、正式报告或哈希。正式报告与 AI 辅助解读使用彼此独立的哈希边界。
+
+### 5.7 GitHub 源码包的数据准备
+
+`FactorGuard_github_source.zip` 不包含 Parquet 和 DuckDB。需要运行真实全市场鉴证时，从 GitHub Release 下载 `FactorGuard_snapshot_20240927_20250926.zip`，解压后保证目录结构如下：
+
+```text
+FactorGuard/
+└── data/
+    └── snapshot/
+        ├── daily_ohlcv.parquet
+        ├── daily_basic.parquet
+        ├── stock_basic.parquet
+        └── manifest.json
+```
+
+也可以使用自己的原始 CSV 显式重建快照。没有 Parquet 时，应用仍可读取因子仓库中的历史预计算摘要，但不会把它冒充本次实时鉴证。
+
 ---
 
 ## 6. 数据说明
 
 | 数据 | 位置 | 说明 |
 |---|---|---|
-| 行情快照 | `data/snapshot/daily_ohlcv.parquet` | A 股全量日线行情（合并生成） |
-| 基础指标快照 | `data/snapshot/daily_basic.parquet` | 市值 / PE / PB / 流通市值 |
-| 因子值缓存 | `data/factor_cache/{factor_id}.parquet` | 预计算因子值 |
+| 快照清单 | `data/snapshot/manifest.json` | 构建参数、日期范围、行数、股票数和 SHA-256 |
+| 行情快照 | `data/snapshot/daily_ohlcv.parquet` | 近一年 A 股全市场日线，1,314,224 行 / 5,473 只 |
+| 基础指标快照 | `data/snapshot/daily_basic.parquet` | 市值 / 换手率 / 利润与现金流 / 资产负债 |
+| 因子值缓存 | `data/factor_cache/` | 预留路径，当前版本尚未启用磁盘级因子缓存 |
 | 元数据库 | `data/factor_master.duckdb` | 因子元数据、鉴证记录、预计算指标 |
 
-### 修改数据文件目录
+原始数据目录可用 `FACTORGUARD_DATA_LOCAL` 覆盖，快照目录可用 `FACTORGUARD_SNAPSHOT_DIR` 覆盖；其余默认参数见 [config.py](config.py)。
 
-所有数据路径集中定义在 [config.py](config.py)，按需修改后**重启 Streamlit** 即可生效：
+GitHub 源码仓库只跟踪快照说明和清单，不跟踪 `.parquet`、`.duckdb`、原始 CSV 或 API Key。比赛可运行包与 GitHub 源码包是两个独立发布产物。
 
-```python
-# config.py
+### 6.1 生成比赛提交包
 
-# 原始本地数据集（每只股票独立 CSV 的根目录）
-DATA_LOCAL = Path("H:/data/stock-trading-data-pro")
-
-# 冻结数据快照（Parquet，由 data_loader.py 从 DATA_LOCAL 合并生成）
-DATA_SNAPSHOT = ROOT_DIR / "data" / "snapshot"
-
-# 预计算因子值缓存目录
-FACTOR_CACHE = ROOT_DIR / "data" / "factor_cache"
-
-# DuckDB 元数据库（因子元数据、鉴证记录、预计算指标）
-DB_PATH = ROOT_DIR / "data" / "factor_master.duckdb"
+```powershell
+py scripts/build_submission.py
 ```
 
-**常见场景：**
-
-| 需求 | 修改方式 |
-|---|---|
-| 本地行情 CSV 存放在其他位置 | 修改 `DATA_LOCAL` 为实际路径，如 `Path("D:/my_stock_data")` |
-| 快照 / 缓存 / 数据库放到项目外 | 修改 `DATA_SNAPSHOT`、`FACTOR_CACHE`、`DB_PATH` 为绝对路径 |
-| 数据迁移到其他机器 | 先备份 `data/` 目录，再按新机器路径更新上述配置 |
-
-> ⚠️ **注意：**
-> - `DATA_LOCAL` 指向的原始 CSV 仅在首次生成快照时读取；若已有 `data/snapshot/*.parquet`，修改 `DATA_LOCAL` 后需删除旧快照才会重新生成；
-> - `DB_PATH` 变更后，历史鉴证记录与预计算指标不会自动迁移，需一并复制 `.duckdb` 文件；
-> - 路径建议使用正斜杠 `/` 或 `Path()` 对象，避免 Windows 反斜杠转义问题。
-
-其他默认参数（预测周期、Bootstrap 配置等）同样在 [config.py](config.py) 中调整。
+输出位于 `dist/FactorGuard_submission.zip`，并附带 SHA-256 文件。提交包自动排除上游 `DataSource` 仓库、嵌套 `.git`、测试缓存、旧截图、复制 CSV 和 `.building` 中间文件。
 
 ---
 
@@ -259,4 +300,6 @@ DB_PATH = ROOT_DIR / "data" / "factor_master.duckdb"
 
 - [产品需求文档 PRD V1.1](DOC/FactorGuard_PRD_V1.1.md)
 - [技术设计文档](DOC/FACTORGUARD_TECHNICAL_DESIGN.md)
-- [MVP 任务清单](DOC/FactorGuard_MVP_TaskList.md)
+- [当前状态与正确性修复规范](DOC/PROJECT_STATUS.md)
+- [原版与当前版对比及 GitHub 发布建议](DOC/PROJECT_COMPARISON_20260819_TO_CURRENT.md)
+- [比赛演示脚本](DOC/COMPETITION_DEMO_SCRIPT.md)

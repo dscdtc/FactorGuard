@@ -23,6 +23,16 @@ from engine.formula_parser import FormulaParser
 def check_negative_window(spec) -> dict:
     """检查公式中是否包含负向位移（未来引用）"""
     formula = getattr(spec, 'formula', '') or ''
+    params = getattr(spec, 'params', {}) or {}
+    window = params.get('window', 0)
+    if isinstance(window, (int, float)) and window < 0:
+        return {
+            "check": "负向位移/未来引用检测",
+            "passed": False,
+            "severity": "fail",
+            "detail": "因子参数包含负向窗口，存在未来数据引用风险",
+            "evidence_id": "QC-WINDOW-001",
+        }
     if not formula:
         return {
             "check": "负向位移/未来引用检测",
@@ -41,12 +51,6 @@ def check_negative_window(spec) -> dict:
         if "必须 >= 0" in err or "negative" in err.lower():
             has_negative = True
             break
-
-    # 同时检查 params 中是否有负窗口
-    params = getattr(spec, 'params', {}) or {}
-    window = params.get('window', 0)
-    if isinstance(window, (int, float)) and window < 0:
-        has_negative = True
 
     if has_negative:
         return {

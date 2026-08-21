@@ -12,6 +12,26 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
+MIN_BASELINE_IC = 0.005
+
+
+def _retention_and_verdict(baseline_ic, stress_ic):
+    """Return a comparable retention ratio without hiding direction flips."""
+    if abs(baseline_ic) < MIN_BASELINE_IC:
+        return None, False, "untested"
+
+    direction_kept = baseline_ic * stress_ic > 0
+    retention_ratio = abs(stress_ic / baseline_ic)
+    if not direction_kept:
+        return retention_ratio, False, "fail"
+    if retention_ratio >= 0.80:
+        verdict = "pass"
+    elif retention_ratio >= 0.50:
+        verdict = "warn"
+    else:
+        verdict = "fail"
+    return retention_ratio, True, verdict
+
 
 def _compute_rank_ic(df, factor_col='factor_value', return_col='forward_return'):
     """计算日均 RankIC（Spearman 相关系数）
@@ -63,33 +83,27 @@ def _test_data_delay(aligned_df, baseline_ic, factor_col='factor_value', return_
             "test_name": "data_delay",
             "test_name_cn": "数据延迟测试",
             "baseline_rank_ic": baseline_ic,
-            "stress_rank_ic": 0.0,
-            "retention_ratio": 0.0,
-            "direction_kept": False,
+            "stress_rank_ic": None,
+            "retention_ratio": None,
+            "direction_kept": None,
             "evidence": "数据量不足，无法完成延迟测试",
-            "verdict": "fail",
+            "verdict": "untested",
         }
 
     stress_ic = _compute_rank_ic(delay_df, factor_col, return_col)
 
-    direction_kept = (baseline_ic * stress_ic) > 0 if baseline_ic != 0 and stress_ic != 0 else False
-    retention_ratio = abs(stress_ic / baseline_ic) if baseline_ic != 0 else 0.0
-
-    if retention_ratio >= 0.80:
-        verdict = "pass"
-    elif retention_ratio >= 0.50:
-        verdict = "warn"
-    else:
-        verdict = "fail"
+    retention_ratio, direction_kept, verdict = _retention_and_verdict(baseline_ic, stress_ic)
 
     evidence = (
         f"将因子值延迟1个交易日后，RankIC 从 {baseline_ic:.4f} "
-        f"变化至 {stress_ic:.4f}，保留比例为 {retention_ratio:.1%}。"
+        f"变化至 {stress_ic:.4f}。"
     )
-    if direction_kept:
-        evidence += "因子方向保持一致。"
+    if retention_ratio is None:
+        evidence += "基线绝对 RankIC 低于 0.005，无法解释保留比例，本项记为未测试。"
+    elif direction_kept:
+        evidence += f"保留比例为 {retention_ratio:.1%}，因子方向保持一致。"
     else:
-        evidence += "因子方向发生反转，信号可能主要来自未来数据泄露或短期反转效应。"
+        evidence += f"保留比例为 {retention_ratio:.1%}，但因子方向发生反转，本项失败。"
 
     return {
         "test_name": "data_delay",
@@ -112,11 +126,11 @@ def _test_remove_micro_cap(aligned_df, baseline_ic, factor_col='factor_value', r
             "test_name": "remove_micro_cap",
             "test_name_cn": "剔除微盘测试",
             "baseline_rank_ic": baseline_ic,
-            "stress_rank_ic": baseline_ic,
-            "retention_ratio": 1.0,
-            "direction_kept": True,
+            "stress_rank_ic": None,
+            "retention_ratio": None,
+            "direction_kept": None,
             "evidence": "数据中缺少 total_mv 列，无法执行剔除微盘测试",
-            "verdict": "pass",
+            "verdict": "untested",
         }
 
     # 每日剔除 total_mv 最低 20% 的股票
@@ -144,23 +158,21 @@ def _test_remove_micro_cap(aligned_df, baseline_ic, factor_col='factor_value', r
     filtered_df = pd.concat(filtered_parts, ignore_index=True)
     stress_ic = _compute_rank_ic(filtered_df, factor_col, return_col)
 
-    direction_kept = (baseline_ic * stress_ic) > 0 if baseline_ic != 0 and stress_ic != 0 else False
-    retention_ratio = abs(stress_ic / baseline_ic) if baseline_ic != 0 else 0.0
-
-    if retention_ratio >= 0.80:
-        verdict = "pass"
-    elif retention_ratio >= 0.50:
-        verdict = "warn"
-    else:
-        verdict = "fail"
+    retention_ratio, direction_kept, verdict = _retention_and_verdict(baseline_ic, stress_ic)
 
     evidence = (
         f"剔除每日市值最低 20% 的股票后，RankIC 从 {baseline_ic:.4f} "
-        f"变化至 {stress_ic:.4f}，保留比例为 {retention_ratio:.1%}。"
+        f"变化至 {stress_ic:.4f}。"
     )
-    if retention_ratio < 0.80:
+    if retention_ratio is None:
+        evidence += "基线绝对 RankIC 低于 0.005，无法解释保留比例，本项记为未测试。"
+    elif not direction_kept:
+        evidence += f"保留比例为 {retention_ratio:.1%}，但方向反转，本项失败。"
+    elif retention_ratio < 0.80:
+        evidence += f"保留比例为 {retention_ratio:.1%}。"
         evidence += "因子收益可能高度依赖微盘股，需警惕流动性风险。"
     else:
+        evidence += f"保留比例为 {retention_ratio:.1%}。"
         evidence += "因子在小市值股票剔除后仍保持有效，收益来源不依赖微盘效应。"
 
     return {
@@ -184,11 +196,11 @@ def _test_market_cap_neutralize(aligned_df, baseline_ic, factor_col='factor_valu
             "test_name": "market_cap_neutralize",
             "test_name_cn": "市值中性化测试",
             "baseline_rank_ic": baseline_ic,
-            "stress_rank_ic": baseline_ic,
-            "retention_ratio": 1.0,
-            "direction_kept": True,
+            "stress_rank_ic": None,
+            "retention_ratio": None,
+            "direction_kept": None,
             "evidence": "数据中缺少 total_mv 列，无法执行市值中性化测试",
-            "verdict": "pass",
+            "verdict": "untested",
         }
 
     # 每日对 factor 回归 log(total_mv)，取残差
@@ -234,11 +246,16 @@ def _test_market_cap_neutralize(aligned_df, baseline_ic, factor_col='factor_valu
     neutral_df = pd.concat(residual_parts, ignore_index=True)
     stress_ic = _compute_rank_ic(neutral_df, factor_col, return_col)
 
-    direction_kept = (baseline_ic * stress_ic) > 0 if baseline_ic != 0 and stress_ic != 0 else False
-    retention_ratio = abs(stress_ic / baseline_ic) if baseline_ic != 0 else 0.0
+    retention_ratio, direction_kept, base_verdict = _retention_and_verdict(baseline_ic, stress_ic)
 
     # 市值中性化后 RankIC 是否仍 > 0.01
-    if abs(stress_ic) >= 0.01:
+    if base_verdict == "untested":
+        verdict = "untested"
+        extra = "基线绝对 RankIC 低于 0.005，无法解释中性化保留率，本项记为未测试。"
+    elif not direction_kept:
+        verdict = "fail"
+        extra = "中性化后方向反转，本项失败。"
+    elif abs(stress_ic) >= 0.01:
         verdict = "pass"
         extra = "中性化后 RankIC 仍大于 0.01，因子在剥离市值影响后仍具预测能力。"
     elif abs(stress_ic) >= 0.005:
@@ -315,25 +332,22 @@ def _test_remove_extreme(aligned_df, baseline_ic, factor_col='factor_value', ret
 
     stress_ic = _compute_rank_ic(filtered_df, factor_col, return_col)
 
-    direction_kept = (baseline_ic * stress_ic) > 0 if baseline_ic != 0 and stress_ic != 0 else False
-    retention_ratio = abs(stress_ic / baseline_ic) if baseline_ic != 0 else 0.0
-
-    if retention_ratio >= 0.80:
-        verdict = "pass"
-    elif retention_ratio >= 0.50:
-        verdict = "warn"
-    else:
-        verdict = "fail"
+    retention_ratio, direction_kept, verdict = _retention_and_verdict(baseline_ic, stress_ic)
 
     n_removed = len(df) - len(filtered_df)
     evidence = (
         f"剔除 |z_factor * z_forward| 最大的 1% 样本（共 {n_removed} 条）后，"
-        f"RankIC 从 {baseline_ic:.4f} 变化至 {stress_ic:.4f}，"
-        f"保留比例为 {retention_ratio:.1%}。"
+        f"RankIC 从 {baseline_ic:.4f} 变化至 {stress_ic:.4f}。"
     )
-    if retention_ratio < 0.80:
+    if retention_ratio is None:
+        evidence += "基线绝对 RankIC 低于 0.005，无法解释保留比例，本项记为未测试。"
+    elif not direction_kept:
+        evidence += f"保留比例为 {retention_ratio:.1%}，但方向反转，本项失败。"
+    elif retention_ratio < 0.80:
+        evidence += f"保留比例为 {retention_ratio:.1%}。"
         evidence += "因子收益可能由少数极端样本驱动，稳健性不足。"
     else:
+        evidence += f"保留比例为 {retention_ratio:.1%}。"
         evidence += "因子收益不依赖极端样本，信号来源较为分散。"
 
     return {
@@ -383,10 +397,10 @@ def run_stress_tests(aligned_df, ohlcv_df=None, factor_col='factor_value', retur
                 "test_name_cn": cn,
                 "baseline_rank_ic": 0.0,
                 "stress_rank_ic": 0.0,
-                "retention_ratio": 0.0,
-                "direction_kept": False,
+                "retention_ratio": None,
+                "direction_kept": None,
                 "evidence": "数据为空，无法执行压力测试",
-                "verdict": "fail",
+                "verdict": "untested",
             }
             for name, cn in [
                 ("data_delay", "数据延迟测试"),
@@ -437,7 +451,8 @@ def summarize_stress_results(results):
             "passed": 0,
             "warned": 0,
             "failed": 0,
-            "mean_retention": 0.0,
+            "untested": 0,
+            "mean_retention": None,
             "overall_verdict": "untested",
             "overall_verdict_cn": "未测试",
             "summary_text": "暂无压力测试数据。",
@@ -447,12 +462,17 @@ def summarize_stress_results(results):
     passed = sum(1 for r in results if r.get("verdict") == "pass")
     warned = sum(1 for r in results if r.get("verdict") == "warn")
     failed = sum(1 for r in results if r.get("verdict") == "fail")
+    untested = sum(1 for r in results if r.get("verdict") == "untested")
 
-    retentions = [r.get("retention_ratio", 0.0) for r in results]
-    mean_retention = float(np.mean(retentions)) if retentions else 0.0
+    retentions = [r.get("retention_ratio") for r in results if r.get("retention_ratio") is not None]
+    mean_retention = float(np.mean(retentions)) if retentions else None
 
     # 总体结论
-    if failed == 0 and warned == 0:
+    if untested:
+        overall_verdict = "untested"
+        overall_verdict_cn = "未完整测试"
+        summary_text = f"{untested}/{total} 项压力测试因数据或基线证据不足而未执行。"
+    elif failed == 0 and warned == 0:
         overall_verdict = "pass"
         overall_verdict_cn = "通过"
         summary_text = (
@@ -486,6 +506,7 @@ def summarize_stress_results(results):
         "passed": passed,
         "warned": warned,
         "failed": failed,
+        "untested": untested,
         "mean_retention": mean_retention,
         "overall_verdict": overall_verdict,
         "overall_verdict_cn": overall_verdict_cn,
